@@ -1,4 +1,5 @@
 *.o
+*.dSYM/
 lhistory
 test_db
 test_tui

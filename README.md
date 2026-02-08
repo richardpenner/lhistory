@@ -75,6 +75,10 @@ The current shell session always appears as the leftmost column.
 
 lhistory installs shell hooks that record every command to a local SQLite database (`~/.local/share/lhistory/history.db`). Recording happens in a background subshell so your prompt is never delayed.
 
+Each terminal tab, split pane, or IDE terminal panel gets a unique session ID (generated from PID, timestamp, and a random value). This means opening three tabs in iTerm, a split in tmux, and a terminal in Cursor gives you five separate sessions — each tracked independently with its own column in the TUI.
+
+lhistory also detects *where* each session is running. It checks environment variables (`TERM_PROGRAM`, `CURSOR_SESSION_ID`, `VSCODE_PID`, `ZED_TERM`) and walks the process tree to identify the parent application. Column headers show the app name — so you can tell at a glance which commands ran in Cursor vs your regular terminal.
+
 When you press up arrow, lhistory launches a TUI that queries the database and displays commands from all recent sessions in a multi-column layout aligned by time.
 
 ## Requirements
