@@ -1,0 +1,8 @@
+*.o
+lhistory
+test_db
+test_tui
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
