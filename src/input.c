@@ -1,4 +1,5 @@
 #include "input.h"
+#include <sys/select.h>
 #include <unistd.h>
 
 static int read_byte(int fd) {
@@ -6,6 +7,18 @@ static int read_byte(int fd) {
     ssize_t n = read(fd, &c, 1);
     if (n <= 0) return -1;
     return c;
+}
+
+/* Non-blocking read: returns byte or -1 if nothing available within timeout_us */
+static int read_byte_timeout(int fd, int timeout_us) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+    struct timeval tv = {0, timeout_us};
+    if (select(fd + 1, &fds, NULL, NULL, &tv) > 0) {
+        return read_byte(fd);
+    }
+    return -1;
 }
 
 lh_key lh_input_read(int fd) {
@@ -16,7 +29,9 @@ lh_key lh_input_read(int fd) {
 
     /* Escape sequences */
     if (c == 27) {
-        int c2 = read_byte(fd);
+        /* Wait briefly — if more bytes follow, it's an escape sequence.
+         * If not, it's a bare Escape keypress. */
+        int c2 = read_byte_timeout(fd, 50000); /* 50ms */
         if (c2 < 0) {
             key.type = LH_KEY_ESCAPE;
             return key;
