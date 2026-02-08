@@ -72,4 +72,19 @@ void lh_command_list_free(lh_command_list *list);
 /* Free a session list and all its strings. */
 void lh_session_list_free(lh_session_list *list);
 
+typedef struct {
+    int commands_today;
+    int commands_7d;
+    int commands_30d;
+    int commands_all;
+    char top_commands[3][64];
+    int top_count;
+    int busiest_hour;
+    char top_typo[64];
+    int typo_count;
+} lh_db_stats;
+
+/* Compute aggregate stats. Uses the provided db connection. */
+void lh_db_compute_stats(sqlite3 *db, lh_db_stats *out);
+
 #endif

@@ -363,6 +363,67 @@ void lh_command_list_free(lh_command_list *list) {
     list->capacity = 0;
 }
 
+void lh_db_compute_stats(sqlite3 *db, lh_db_stats *out) {
+    memset(out, 0, sizeof(*out));
+    out->busiest_hour = -1;
+
+    int64_t now = now_ms();
+    int64_t day_ms = 86400LL * 1000;
+    int64_t thresholds[] = {now - day_ms, now - 7 * day_ms, now - 30 * day_ms, 0};
+    int *targets[] = {&out->commands_today, &out->commands_7d, &out->commands_30d, &out->commands_all};
+
+    for (int i = 0; i < 4; i++) {
+        sqlite3_stmt *stmt;
+        const char *sql = thresholds[i]
+            ? "SELECT COUNT(*) FROM commands WHERE timestamp >= ?"
+            : "SELECT COUNT(*) FROM commands";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) continue;
+        if (thresholds[i]) sqlite3_bind_int64(stmt, 1, thresholds[i]);
+        if (sqlite3_step(stmt) == SQLITE_ROW)
+            *targets[i] = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+
+    {
+        sqlite3_stmt *stmt;
+        const char *sql = "SELECT substr(command, 1, instr(command||' ',' ')-1), COUNT(*) as c "
+                          "FROM commands GROUP BY 1 ORDER BY c DESC LIMIT 3";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW && out->top_count < 3) {
+                const char *w = (const char *)sqlite3_column_text(stmt, 0);
+                if (w) snprintf(out->top_commands[out->top_count], 64, "%s", w);
+                out->top_count++;
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    {
+        sqlite3_stmt *stmt;
+        const char *sql = "SELECT CAST(strftime('%H', timestamp/1000, 'unixepoch', 'localtime') AS INTEGER), "
+                          "COUNT(*) as c FROM commands GROUP BY 1 ORDER BY c DESC LIMIT 1";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW)
+                out->busiest_hour = sqlite3_column_int(stmt, 0);
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    {
+        sqlite3_stmt *stmt;
+        const char *sql = "SELECT substr(command, 1, instr(command||' ',' ')-1), COUNT(*) as c "
+                          "FROM commands WHERE exit_code = 127 GROUP BY 1 ORDER BY c DESC LIMIT 1";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char *w = (const char *)sqlite3_column_text(stmt, 0);
+                if (w) snprintf(out->top_typo, sizeof(out->top_typo), "%s", w);
+                out->typo_count = sqlite3_column_int(stmt, 1);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+}
+
 void lh_session_list_free(lh_session_list *list) {
     for (int i = 0; i < list->count; i++) {
         free(list->items[i].session_id);

@@ -38,10 +38,14 @@ typedef enum {
 typedef struct {
     lh_session *session;
     lh_command_list commands;
-    /* filtered indices (into commands.items) when searching */
     int *filtered;
     int filtered_count;
 } tui_column;
+
+typedef struct {
+    lh_command *cmd;
+    int col_idx;
+} merged_row;
 
 typedef struct {
     sqlite3 *db;
@@ -49,10 +53,9 @@ typedef struct {
     int num_columns;
     int visible_columns;
     int col_width;
-    int col_offset;     /* first visible column index */
-    int cur_col;        /* cursor column (within visible range) */
-    int cur_row;        /* cursor row (0 = most recent) */
-    int scroll_offset;  /* vertical scroll */
+    int col_offset;
+    int cur_row;
+    int scroll_offset;
     lh_term_size size;
     tui_mode mode;
     char search_buf[SEARCH_BUF_SIZE];
@@ -60,7 +63,11 @@ typedef struct {
     int needs_redraw;
     char render_buf[RENDER_BUF_SIZE];
     int render_len;
-    const char *current_session_id; /* pin this session to leftmost column */
+    const char *current_session_id;
+    merged_row *merged;
+    int merged_count;
+    lh_db_stats stats;
+    int stats_ready;
 } tui_state;
 
 static tui_state *g_state = NULL;
@@ -94,33 +101,29 @@ static void buf_printf(tui_state *s, const char *fmt, ...) {
     }
 }
 
-/* Strip control characters (prevent terminal escape injection) */
 static void sanitize_command(char *buf, int bufsize) {
     int j = 0;
     for (int i = 0; buf[i] && j < bufsize - 1; i++) {
         unsigned char c = (unsigned char)buf[i];
         if (c == 0x1b) {
-            /* Skip ESC and any following CSI sequence */
             if (buf[i + 1] == '[') {
                 i++;
                 while (buf[i + 1] && !((unsigned char)buf[i + 1] >= 0x40 && (unsigned char)buf[i + 1] <= 0x7e))
                     i++;
-                if (buf[i + 1]) i++; /* skip final byte */
+                if (buf[i + 1]) i++;
             }
             continue;
         }
-        if (c < 32 && c != '\t') continue; /* strip other control chars */
+        if (c < 32 && c != '\t') continue;
         buf[j++] = (char)c;
     }
     buf[j] = '\0';
 }
 
-/* Shorten a directory path: ~/projects/foo → ~/p/foo, or keep last component */
 static void shorten_dir(const char *dir, char *out, int maxlen) {
     const char *home = getenv("HOME");
     const char *p = dir;
 
-    /* Replace home prefix with ~ */
     char tmp[512];
     if (home && strncmp(dir, home, strlen(home)) == 0) {
         snprintf(tmp, sizeof(tmp), "~%s", dir + strlen(home));
@@ -133,20 +136,17 @@ static void shorten_dir(const char *dir, char *out, int maxlen) {
         return;
     }
 
-    /* Find last component */
     const char *last_slash = strrchr(p, '/');
     if (last_slash) {
         int tail_len = (int)strlen(last_slash);
         int budget = maxlen - tail_len - 1;
         if (budget > 0 && budget < len) {
-            /* Abbreviate intermediate dirs */
             char abbrev[512] = {0};
             int ai = 0;
             for (int i = 0; p[i] && &p[i] < last_slash && ai < budget; i++) {
                 if (i == 0 || p[i - 1] == '/') {
                     abbrev[ai++] = p[i];
                     if (p[i] != '/' && p[i + 1] != '/') {
-                        /* skip to next slash */
                         while (p[i + 1] && p[i + 1] != '/') i++;
                     }
                 } else {
@@ -155,7 +155,7 @@ static void shorten_dir(const char *dir, char *out, int maxlen) {
             }
             snprintf(out, (size_t)maxlen, "%s%s", abbrev, last_slash);
         } else {
-            snprintf(out, (size_t)maxlen, "…%s", last_slash);
+            snprintf(out, (size_t)maxlen, "\xe2\x80\xa6%s", last_slash);
         }
     } else {
         snprintf(out, (size_t)maxlen, "%s", p + len - maxlen + 1);
@@ -169,13 +169,46 @@ static void format_time(int64_t ts_ms, char *out, int maxlen) {
     snprintf(out, (size_t)maxlen, "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
+static int merged_cmp(const void *a, const void *b) {
+    const merged_row *ma = a, *mb = b;
+    if (ma->cmd->timestamp != mb->cmd->timestamp)
+        return (ma->cmd->timestamp > mb->cmd->timestamp) ? -1 : 1;
+    return (ma->cmd->id > mb->cmd->id) ? -1 : 1;
+}
+
+static void build_merged_list(tui_state *s) {
+    free(s->merged);
+    s->merged = NULL;
+    s->merged_count = 0;
+
+    int total = 0;
+    for (int c = 0; c < s->num_columns; c++)
+        total += s->columns[c].filtered_count;
+
+    if (total == 0) return;
+
+    s->merged = malloc((size_t)total * sizeof(merged_row));
+    if (!s->merged) return;
+
+    int idx = 0;
+    for (int c = 0; c < s->num_columns; c++) {
+        tui_column *col = &s->columns[c];
+        for (int i = 0; i < col->filtered_count; i++) {
+            s->merged[idx].cmd = &col->commands.items[col->filtered[i]];
+            s->merged[idx].col_idx = c;
+            idx++;
+        }
+    }
+    s->merged_count = idx;
+    qsort(s->merged, (size_t)s->merged_count, sizeof(merged_row), merged_cmp);
+}
+
 static void apply_search_filter(tui_state *s) {
     for (int c = 0; c < s->num_columns; c++) {
         tui_column *col = &s->columns[c];
         col->filtered_count = 0;
 
         if (s->search_len == 0) {
-            /* No filter — all commands visible */
             for (int i = 0; i < col->commands.count; i++) {
                 col->filtered[i] = i;
             }
@@ -188,28 +221,73 @@ static void apply_search_filter(tui_state *s) {
             }
         }
     }
+    build_merged_list(s);
 }
 
 static int max_visible_rows(tui_state *s) {
-    /* title=1, header=1, border=1, status_bar=2 at bottom */
-    return s->size.rows - 5;
+    int rows = s->size.rows - 5;
+    return rows > 0 ? rows : 1;
 }
 
-/* Get the command at a given (col, row) in the filtered view.
- * Returns NULL if out of bounds. */
-static lh_command *get_command(tui_state *s, int col_idx, int row) {
-    int abs_col = s->col_offset + col_idx;
-    if (abs_col < 0 || abs_col >= s->num_columns) return NULL;
-    tui_column *col = &s->columns[abs_col];
-    int idx = s->scroll_offset + row;
-    if (idx < 0 || idx >= col->filtered_count) return NULL;
-    return &col->commands.items[col->filtered[idx]];
+static void format_count(int n, char *buf, int bufsize) {
+    if (n >= 100000) snprintf(buf, bufsize, "%dk", n / 1000);
+    else if (n >= 1000) snprintf(buf, bufsize, "%.1fk", n / 1000.0);
+    else snprintf(buf, bufsize, "%d", n);
+}
+
+static void format_hour(int h, char *buf, int bufsize) {
+    if (h == 0) snprintf(buf, bufsize, "12am");
+    else if (h < 12) snprintf(buf, bufsize, "%dam", h);
+    else if (h == 12) snprintf(buf, bufsize, "12pm");
+    else snprintf(buf, bufsize, "%dpm", h - 12);
+}
+
+static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) {
+    char timebuf[16];
+    format_time(cmd->timestamp, timebuf, sizeof(timebuf));
+
+    const char *exit_color = "";
+    char exit_indicator = ' ';
+    if (cmd->has_exit_code) {
+        if (cmd->exit_code != 0) {
+            exit_color = C_ERR_FG;
+            exit_indicator = '!';
+        } else {
+            exit_color = C_OK_FG;
+            exit_indicator = ' ';
+        }
+    }
+
+    int time_width = 9;
+    int cmd_max = s->col_width - time_width - 2;
+    if (cmd_max < 1) cmd_max = 1;
+
+    char cmd_trunc[256];
+    snprintf(cmd_trunc, sizeof(cmd_trunc), "%s", cmd->command);
+    sanitize_command(cmd_trunc, sizeof(cmd_trunc));
+    int clen = (int)strlen(cmd_trunc);
+    if (clen > cmd_max) {
+        int trunc_at = cmd_max - 1;
+        if (trunc_at < 0) trunc_at = 0;
+        if (trunc_at + 4 < (int)sizeof(cmd_trunc)) {
+            cmd_trunc[trunc_at] = '\0';
+            strcat(cmd_trunc, "\xe2\x80\xa6");
+        } else {
+            cmd_trunc[cmd_max] = '\0';
+        }
+        clen = cmd_max;
+    }
+
+    if (!is_selected) buf_puts(s, C_TIME_FG);
+    buf_printf(s, "%s ", timebuf);
+    if (!is_selected && exit_color[0]) buf_puts(s, exit_color);
+    buf_printf(s, "%c", exit_indicator);
+    if (!is_selected) buf_puts(s, C_RESET);
+    buf_printf(s, "%-*s", cmd_max, cmd_trunc);
 }
 
 static void render(tui_state *s) {
     s->render_len = 0;
-
-    /* Clear screen, home cursor */
     buf_puts(s, "\x1b[H\x1b[2J");
 
     int divisor = s->size.cols / MIN_COL_WIDTH;
@@ -220,25 +298,114 @@ static void render(tui_state *s) {
     if (s->visible_columns > s->num_columns) s->visible_columns = s->num_columns;
     if (s->visible_columns < 1) s->visible_columns = 1;
 
-    /* Clamp cursor */
-    if (s->cur_col >= s->visible_columns) s->cur_col = s->visible_columns - 1;
+    int active_abs_col = -1;
+    if (s->merged_count > 0) {
+        int idx = s->scroll_offset + s->cur_row;
+        if (idx >= 0 && idx < s->merged_count)
+            active_abs_col = s->merged[idx].col_idx;
+    }
+
+    if (active_abs_col >= 0) {
+        if (active_abs_col < s->col_offset)
+            s->col_offset = active_abs_col;
+        else if (active_abs_col >= s->col_offset + s->visible_columns)
+            s->col_offset = active_abs_col - s->visible_columns + 1;
+    }
     if (s->col_offset + s->visible_columns > s->num_columns)
         s->col_offset = s->num_columns - s->visible_columns;
     if (s->col_offset < 0) s->col_offset = 0;
 
+    if (s->merged_count > 0) {
+        if (s->scroll_offset + s->cur_row >= s->merged_count) {
+            s->cur_row = 0;
+            s->scroll_offset = 0;
+        }
+    } else {
+        s->cur_row = 0;
+        s->scroll_offset = 0;
+    }
+
     int vis_rows = max_visible_rows(s);
+    int used = s->visible_columns * s->col_width;
 
     /* === Title bar === */
     {
         char title[64];
         snprintf(title, sizeof(title), " lhistory %s ", LHISTORY_VERSION);
         int tlen = (int)strlen(title);
-        int pad_left = (s->size.cols - tlen) / 2;
-        int pad_right = s->size.cols - tlen - pad_left;
-        buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
-        for (int i = 0; i < pad_left; i++) buf_puts(s, " ");
-        buf_puts(s, title);
-        for (int i = 0; i < pad_right; i++) buf_puts(s, " ");
+
+        if (s->stats_ready) {
+            char segments[8][80];
+            int seg_lens[8];
+            int nseg = 0;
+
+            char buf[16];
+            format_count(s->stats.commands_today, buf, sizeof(buf));
+            snprintf(segments[nseg], 80, "today: %s", buf); seg_lens[nseg] = (int)strlen(segments[nseg]); nseg++;
+            format_count(s->stats.commands_7d, buf, sizeof(buf));
+            snprintf(segments[nseg], 80, "7d: %s", buf); seg_lens[nseg] = (int)strlen(segments[nseg]); nseg++;
+            format_count(s->stats.commands_30d, buf, sizeof(buf));
+            snprintf(segments[nseg], 80, "30d: %s", buf); seg_lens[nseg] = (int)strlen(segments[nseg]); nseg++;
+            format_count(s->stats.commands_all, buf, sizeof(buf));
+            snprintf(segments[nseg], 80, "all: %s", buf); seg_lens[nseg] = (int)strlen(segments[nseg]); nseg++;
+
+            if (s->stats.top_count > 0) {
+                char top[80] = "top: ";
+                for (int i = 0; i < s->stats.top_count; i++) {
+                    if (i > 0) strcat(top, ", ");
+                    strcat(top, s->stats.top_commands[i]);
+                }
+                snprintf(segments[nseg], 80, "%s", top); seg_lens[nseg] = (int)strlen(segments[nseg]); nseg++;
+            }
+
+            if (s->stats.busiest_hour >= 0) {
+                char hbuf[8];
+                format_hour(s->stats.busiest_hour, hbuf, sizeof(hbuf));
+                snprintf(segments[nseg], 80, "peak: %s", hbuf); seg_lens[nseg] = (int)strlen(segments[nseg]); nseg++;
+            }
+
+            if (s->stats.top_typo[0]) {
+                snprintf(segments[nseg], 80, "typo: \"%s\" (%dx)", s->stats.top_typo, s->stats.typo_count);
+                seg_lens[nseg] = (int)strlen(segments[nseg]); nseg++;
+            }
+
+            int fit = 0;
+            int stats_width = 0;
+            for (int i = 0; i < nseg; i++) {
+                int sep = (i == 0) ? 0 : 3;
+                int need = seg_lens[i] + sep;
+                if (tlen + 2 + stats_width + need > s->size.cols) break;
+                stats_width += need;
+                fit++;
+            }
+
+            if (fit > 0) {
+                int gap = s->size.cols - tlen - stats_width - 1;
+                buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
+                buf_puts(s, title);
+                for (int i = 0; i < gap; i++) buf_puts(s, " ");
+                buf_puts(s, "\x1b[22m\x1b[38;5;250m");
+                for (int i = 0; i < fit; i++) {
+                    if (i > 0) buf_printf(s, " %s\xe2\x94\x82%s ", C_DIM, "\x1b[22m\x1b[38;5;250m");
+                    buf_puts(s, segments[i]);
+                }
+                buf_puts(s, " ");
+            } else {
+                int pad_left = (s->size.cols - tlen) / 2;
+                int pad_right = s->size.cols - tlen - pad_left;
+                buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
+                for (int i = 0; i < pad_left; i++) buf_puts(s, " ");
+                buf_puts(s, title);
+                for (int i = 0; i < pad_right; i++) buf_puts(s, " ");
+            }
+        } else {
+            int pad_left = (s->size.cols - tlen) / 2;
+            int pad_right = s->size.cols - tlen - pad_left;
+            buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
+            for (int i = 0; i < pad_left; i++) buf_puts(s, " ");
+            buf_puts(s, title);
+            for (int i = 0; i < pad_right; i++) buf_puts(s, " ");
+        }
         buf_puts(s, C_RESET "\r\n");
     }
 
@@ -255,21 +422,18 @@ static void render(tui_state *s) {
         if (col->session->ide) {
             char ide_upper[16];
             snprintf(ide_upper, sizeof(ide_upper), "%s", col->session->ide);
-            /* capitalize first char */
             if (ide_upper[0] >= 'a' && ide_upper[0] <= 'z') ide_upper[0] -= 32;
             snprintf(header, sizeof(header), "[%s] %s", ide_upper, dir_short);
         } else {
             snprintf(header, sizeof(header), "%s", dir_short);
         }
 
-        /* Truncate header to col width */
         int hlen = (int)strlen(header);
         if (hlen > s->col_width - 1) {
             header[s->col_width - 2] = '\0';
-            hlen = s->col_width - 2;
         }
 
-        if (c == s->cur_col) {
+        if (abs_c == active_abs_col) {
             buf_puts(s, C_ACTIVE C_BOLD);
         } else {
             buf_puts(s, C_HEADER_FG);
@@ -278,82 +442,35 @@ static void render(tui_state *s) {
         buf_printf(s, " %-*s", s->col_width - 1, header);
         buf_puts(s, C_RESET C_HEADER_BG);
     }
-    /* Fill rest of line */
-    int used = s->visible_columns * s->col_width;
     for (int i = used; i < s->size.cols; i++) buf_puts(s, " ");
     buf_puts(s, C_RESET "\r\n");
 
     /* === Border line === */
     buf_puts(s, C_BORDER);
     for (int c = 0; c < s->visible_columns; c++) {
-        for (int i = 0; i < s->col_width; i++) buf_puts(s, "─");
+        for (int i = 0; i < s->col_width; i++) buf_puts(s, "\xe2\x94\x80");
     }
-    for (int i = used; i < s->size.cols; i++) buf_puts(s, "─");
+    for (int i = used; i < s->size.cols; i++) buf_puts(s, "\xe2\x94\x80");
     buf_puts(s, C_RESET "\r\n");
 
-    /* === Command rows (bottom = newest, top = oldest) === */
+    /* === Command rows (merged timeline: bottom = newest) === */
     for (int r = 0; r < vis_rows; r++) {
-        int data_row = vis_rows - 1 - r; /* screen bottom = data_row 0 = newest */
+        int data_row = vis_rows - 1 - r;
+        int merged_idx = s->scroll_offset + data_row;
+        merged_row *entry = (merged_idx < s->merged_count) ? &s->merged[merged_idx] : NULL;
+        int is_cursor_row = (data_row == s->cur_row);
+
         for (int c = 0; c < s->visible_columns; c++) {
-            lh_command *cmd = get_command(s, c, data_row);
-            int is_selected = (c == s->cur_col && data_row == s->cur_row);
+            int abs_c = s->col_offset + c;
+            int has_cmd = (entry && entry->col_idx == abs_c);
+            int is_selected = (is_cursor_row && has_cmd);
 
             if (is_selected) {
                 buf_puts(s, C_SEL_BG C_SEL_FG);
             }
 
-            if (cmd) {
-                /* Time prefix */
-                char timebuf[16];
-                format_time(cmd->timestamp, timebuf, sizeof(timebuf));
-
-                /* Exit code coloring */
-                const char *exit_color = "";
-                char exit_indicator = ' ';
-                if (cmd->has_exit_code) {
-                    if (cmd->exit_code != 0) {
-                        exit_color = C_ERR_FG;
-                        exit_indicator = '!';
-                    } else {
-                        exit_color = C_OK_FG;
-                        exit_indicator = ' ';
-                    }
-                }
-
-                /* Truncate command to fit */
-                int time_width = 9; /* "HH:MM:SS " */
-                int cmd_max = s->col_width - time_width - 2;
-                if (cmd_max < 1) cmd_max = 1;
-
-                char cmd_trunc[256];
-                snprintf(cmd_trunc, sizeof(cmd_trunc), "%s", cmd->command);
-                sanitize_command(cmd_trunc, sizeof(cmd_trunc));
-                int clen = (int)strlen(cmd_trunc);
-                if (clen > cmd_max) {
-                    /* Leave room for "…" (3 bytes UTF-8) + null */
-                    int trunc_at = cmd_max - 1;
-                    if (trunc_at < 0) trunc_at = 0;
-                    if (trunc_at + 4 < (int)sizeof(cmd_trunc)) {
-                        cmd_trunc[trunc_at] = '\0';
-                        strcat(cmd_trunc, "\xe2\x80\xa6"); /* … */
-                    } else {
-                        cmd_trunc[cmd_max] = '\0';
-                    }
-                    clen = cmd_max;
-                }
-
-                if (!is_selected) {
-                    buf_puts(s, C_TIME_FG);
-                }
-                buf_printf(s, "%s ", timebuf);
-                if (!is_selected && exit_color[0]) {
-                    buf_puts(s, exit_color);
-                }
-                buf_printf(s, "%c", exit_indicator);
-                if (!is_selected) {
-                    buf_puts(s, C_RESET);
-                }
-                buf_printf(s, "%-*s", cmd_max, cmd_trunc);
+            if (has_cmd) {
+                render_command_cell(s, entry->cmd, is_selected);
             } else {
                 buf_printf(s, "%-*s", s->col_width, "");
             }
@@ -362,49 +479,48 @@ static void render(tui_state *s) {
                 buf_puts(s, C_RESET);
             }
         }
-        /* Fill rest of line */
         for (int i = used; i < s->size.cols; i++) buf_puts(s, " ");
         buf_puts(s, "\r\n");
     }
 
-    /* === Status bar (bottom 2 lines) === */
-    /* Full command preview */
+    /* === Status bar === */
     buf_puts(s, C_STATUS_BG C_STATUS_FG);
-    lh_command *sel = get_command(s, s->cur_col, s->cur_row);
-    if (sel) {
-        char preview[512];
-        snprintf(preview, sizeof(preview), " %s", sel->command);
-        sanitize_command(preview, sizeof(preview));
-        int plen = (int)strlen(preview);
-        if (plen > s->size.cols) {
-            preview[s->size.cols - 1] = '\0';
-            plen = s->size.cols - 1;
+    {
+        lh_command *sel = NULL;
+        int sel_idx = s->scroll_offset + s->cur_row;
+        if (sel_idx >= 0 && sel_idx < s->merged_count)
+            sel = s->merged[sel_idx].cmd;
+        if (sel) {
+            char preview[512];
+            snprintf(preview, sizeof(preview), " %s", sel->command);
+            sanitize_command(preview, sizeof(preview));
+            int plen = (int)strlen(preview);
+            if (plen > s->size.cols) {
+                preview[s->size.cols - 1] = '\0';
+            }
+            buf_printf(s, "%-*s", s->size.cols, preview);
+        } else {
+            buf_printf(s, "%-*s", s->size.cols, "");
         }
-        buf_printf(s, "%-*s", s->size.cols, preview);
-    } else {
-        buf_printf(s, "%-*s", s->size.cols, "");
     }
     buf_puts(s, C_RESET "\r\n");
 
-    /* Help / search line */
     buf_puts(s, C_STATUS_BG);
     if (s->mode == MODE_SEARCH) {
         buf_puts(s, C_SEARCH_FG);
         buf_printf(s, " /%s", s->search_buf);
-        /* cursor indicator */
-        buf_puts(s, "█");
+        buf_puts(s, "\xe2\x96\x88");
         int fill = s->size.cols - s->search_len - 3;
         for (int i = 0; i < fill; i++) buf_puts(s, " ");
     } else {
         buf_puts(s, C_STATUS_FG C_DIM);
-        char help[] = " ↑↓/jk:navigate  ←→/hl:columns  /:search  Enter:select  q/Esc:quit";
+        char help[] = " \xe2\x86\x91\xe2\x86\x93/jk:navigate  \xe2\x86\x90\xe2\x86\x92/hl:sessions  /:search  Enter:select  q/Esc:quit";
         int hlen = (int)strlen(help);
         if (hlen > s->size.cols) help[s->size.cols] = '\0';
         buf_printf(s, "%-*s", s->size.cols, help);
     }
     buf_puts(s, C_RESET);
 
-    /* Flush render buffer */
     lh_term_write(s->render_buf, s->render_len);
     s->needs_redraw = 0;
 }
@@ -413,7 +529,6 @@ static void load_data(tui_state *s) {
     lh_session_list sessions = lh_db_recent_sessions(s->db, MAX_SESSIONS);
     s->num_columns = sessions.count;
 
-    /* If current session is specified, swap it to index 0 */
     if (s->current_session_id && sessions.count > 1) {
         for (int i = 1; i < sessions.count; i++) {
             if (strcmp(sessions.items[i].session_id, s->current_session_id) == 0) {
@@ -426,7 +541,6 @@ static void load_data(tui_state *s) {
     }
 
     for (int i = 0; i < sessions.count; i++) {
-        /* Copy session into its own allocation so cleanup can free each independently */
         lh_session *sp = malloc(sizeof(lh_session));
         if (!sp) { s->num_columns = i; break; }
         *sp = sessions.items[i];
@@ -438,15 +552,12 @@ static void load_data(tui_state *s) {
         s->columns[i].filtered_count = 0;
     }
 
-    /* Free the contiguous sessions array — strings are now owned by the copied structs */
     free(sessions.items);
-
     apply_search_filter(s);
 }
 
 static void cleanup_data(tui_state *s) {
     for (int i = 0; i < s->num_columns; i++) {
-        /* Free the session (was allocated by lh_db_recent_sessions) */
         free(s->columns[i].session->session_id);
         free(s->columns[i].session->shell);
         free(s->columns[i].session->ide);
@@ -455,6 +566,7 @@ static void cleanup_data(tui_state *s) {
         lh_command_list_free(&s->columns[i].commands);
         free(s->columns[i].filtered);
     }
+    free(s->merged);
 }
 
 int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
@@ -464,14 +576,12 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
     state.current_session_id = current_session_id;
     g_state = &state;
 
-    /* Enter raw mode */
     int fd = lh_term_raw_enter();
     if (fd < 0) return 0;
 
     lh_term_on_resize(resize_handler);
     state.size = lh_term_get_size();
 
-    /* Load data */
     load_data(&state);
 
     if (state.num_columns == 0) {
@@ -479,6 +589,9 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
         g_state = NULL;
         return 0;
     }
+
+    lh_db_compute_stats(state.db, &state.stats);
+    state.stats_ready = 1;
 
     state.needs_redraw = 1;
     int running = 1;
@@ -490,6 +603,7 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
         }
 
         lh_key key = lh_input_read(fd);
+        state.needs_redraw = 1;
 
         if (state.mode == MODE_SEARCH) {
             switch (key.type) {
@@ -500,11 +614,9 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
                     apply_search_filter(&state);
                     state.cur_row = 0;
                     state.scroll_offset = 0;
-                    state.needs_redraw = 1;
                     break;
                 case LH_KEY_ENTER:
                     state.mode = MODE_NORMAL;
-                    state.needs_redraw = 1;
                     break;
                 case LH_KEY_BACKSPACE:
                     if (state.search_len > 0) {
@@ -512,7 +624,6 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
                         apply_search_filter(&state);
                         state.cur_row = 0;
                         state.scroll_offset = 0;
-                        state.needs_redraw = 1;
                     }
                     break;
                 case LH_KEY_CHAR:
@@ -525,7 +636,6 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
                 case LH_KEY_G:
                 case LH_KEY_G_SHIFT: {
                     char c = key.ch;
-                    /* Map named keys back to chars for search */
                     if (key.type == LH_KEY_SLASH) c = '/';
                     else if (key.type == LH_KEY_J) c = 'j';
                     else if (key.type == LH_KEY_K) c = 'k';
@@ -541,7 +651,6 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
                         apply_search_filter(&state);
                         state.cur_row = 0;
                         state.scroll_offset = 0;
-                        state.needs_redraw = 1;
                     }
                     break;
                 }
@@ -553,67 +662,114 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
 
         /* Normal mode */
         int vis_rows = max_visible_rows(&state);
-        int abs_col = state.col_offset + state.cur_col;
-        int max_row = 0;
-        if (abs_col >= 0 && abs_col < state.num_columns) {
-            max_row = state.columns[abs_col].filtered_count - 1;
-        }
 
         switch (key.type) {
             case LH_KEY_UP:
-            case LH_KEY_K:
-                /* Up = back in time (older commands, higher on screen) */
-                if (state.scroll_offset + state.cur_row < max_row) {
-                    if (state.cur_row < vis_rows - 1) {
-                        state.cur_row++;
-                    } else {
-                        state.scroll_offset++;
-                    }
+            case LH_KEY_K: {
+                if (state.merged_count == 0) break;
+                int idx = state.scroll_offset + state.cur_row;
+                if (idx >= state.merged_count) break;
+                int cur_c = state.merged[idx].col_idx;
+                int next = -1;
+                for (int i = idx + 1; i < state.merged_count; i++) {
+                    if (state.merged[i].col_idx == cur_c) { next = i; break; }
                 }
-                state.needs_redraw = 1;
+                if (next < 0) break;
+                if (next >= state.scroll_offset + vis_rows) {
+                    state.scroll_offset = next - vis_rows + 1;
+                    state.cur_row = vis_rows - 1;
+                } else {
+                    state.cur_row = next - state.scroll_offset;
+                }
                 break;
+            }
 
             case LH_KEY_DOWN:
-            case LH_KEY_J:
-                /* Down = forward in time (newer commands, lower on screen) */
-                if (state.cur_row > 0) {
-                    state.cur_row--;
-                } else if (state.scroll_offset > 0) {
-                    state.scroll_offset--;
+            case LH_KEY_J: {
+                if (state.merged_count == 0) break;
+                int idx = state.scroll_offset + state.cur_row;
+                if (idx >= state.merged_count) break;
+                int cur_c = state.merged[idx].col_idx;
+                int next = -1;
+                for (int i = idx - 1; i >= 0; i--) {
+                    if (state.merged[i].col_idx == cur_c) { next = i; break; }
                 }
-                state.needs_redraw = 1;
+                if (next < 0) break;
+                if (next < state.scroll_offset) {
+                    state.scroll_offset = next;
+                    state.cur_row = 0;
+                } else {
+                    state.cur_row = next - state.scroll_offset;
+                }
                 break;
+            }
 
             case LH_KEY_LEFT:
-            case LH_KEY_H:
-                if (state.cur_col > 0) {
-                    state.cur_col--;
-                } else if (state.col_offset > 0) {
-                    state.col_offset--;
+            case LH_KEY_H: {
+                if (state.merged_count == 0) break;
+                int idx = state.scroll_offset + state.cur_row;
+                if (idx >= state.merged_count) break;
+                int cur_c = state.merged[idx].col_idx;
+                if (cur_c <= 0) break;
+                int target_col = cur_c - 1;
+
+                int best = -1;
+                for (int d = 1; d <= state.merged_count; d++) {
+                    if (idx - d >= 0 && state.merged[idx - d].col_idx == target_col) { best = idx - d; break; }
+                    if (idx + d < state.merged_count && state.merged[idx + d].col_idx == target_col) { best = idx + d; break; }
                 }
-                state.needs_redraw = 1;
+                if (best < 0) break;
+
+                if (best < state.scroll_offset) {
+                    state.scroll_offset = best;
+                    state.cur_row = 0;
+                } else if (best >= state.scroll_offset + vis_rows) {
+                    state.cur_row = vis_rows - 1;
+                    state.scroll_offset = best - vis_rows + 1;
+                } else {
+                    state.cur_row = best - state.scroll_offset;
+                }
                 break;
+            }
 
             case LH_KEY_RIGHT:
-            case LH_KEY_L:
-                if (state.cur_col < state.visible_columns - 1) {
-                    state.cur_col++;
-                } else if (state.col_offset + state.visible_columns < state.num_columns) {
-                    state.col_offset++;
+            case LH_KEY_L: {
+                if (state.merged_count == 0) break;
+                int idx = state.scroll_offset + state.cur_row;
+                if (idx >= state.merged_count) break;
+                int cur_c = state.merged[idx].col_idx;
+                if (cur_c >= state.num_columns - 1) break;
+                int target_col = cur_c + 1;
+
+                int best = -1;
+                for (int d = 1; d <= state.merged_count; d++) {
+                    if (idx - d >= 0 && state.merged[idx - d].col_idx == target_col) { best = idx - d; break; }
+                    if (idx + d < state.merged_count && state.merged[idx + d].col_idx == target_col) { best = idx + d; break; }
                 }
-                state.needs_redraw = 1;
+                if (best < 0) break;
+
+                if (best < state.scroll_offset) {
+                    state.scroll_offset = best;
+                    state.cur_row = 0;
+                } else if (best >= state.scroll_offset + vis_rows) {
+                    state.cur_row = vis_rows - 1;
+                    state.scroll_offset = best - vis_rows + 1;
+                } else {
+                    state.cur_row = best - state.scroll_offset;
+                }
                 break;
+            }
 
             case LH_KEY_SLASH:
                 state.mode = MODE_SEARCH;
                 state.search_buf[0] = '\0';
                 state.search_len = 0;
-                state.needs_redraw = 1;
                 break;
 
             case LH_KEY_ENTER: {
-                lh_command *cmd = get_command(&state, state.cur_col, state.cur_row);
-                if (cmd) {
+                int idx = state.scroll_offset + state.cur_row;
+                if (idx >= 0 && idx < state.merged_count) {
+                    lh_command *cmd = state.merged[idx].cmd;
                     int clen = (int)strlen(cmd->command);
                     if (clen >= result_buf_size) clen = result_buf_size - 1;
                     memcpy(result_buf, cmd->command, (size_t)clen);
@@ -630,21 +786,17 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
                 break;
 
             case LH_KEY_G:
-                /* g = jump to top of screen (oldest) */
-                if (max_row >= vis_rows) {
-                    state.scroll_offset = max_row - vis_rows + 1;
+                if (state.merged_count > vis_rows) {
+                    state.scroll_offset = state.merged_count - vis_rows;
                     state.cur_row = vis_rows - 1;
-                } else {
-                    state.cur_row = max_row;
+                } else if (state.merged_count > 0) {
+                    state.cur_row = state.merged_count - 1;
                 }
-                state.needs_redraw = 1;
                 break;
 
             case LH_KEY_G_SHIFT:
-                /* G = jump to bottom of screen (newest) */
                 state.cur_row = 0;
                 state.scroll_offset = 0;
-                state.needs_redraw = 1;
                 break;
 
             default:
