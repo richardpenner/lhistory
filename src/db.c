@@ -81,16 +81,26 @@ static void set_file_permissions(const char *path) {
     chmod(path, 0600);
 }
 
-static void prune_old_data(sqlite3 *db) {
-    /* Delete commands older than 90 days */
-    int64_t cutoff = now_ms() - (int64_t)90 * 24 * 60 * 60 * 1000;
+static void prune_if_oversized(sqlite3 *db) {
+    /* Prune when DB exceeds 10MB: delete oldest 25% of commands */
+    int64_t page_count = 0, page_size = 0;
     sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db,
-            "DELETE FROM commands WHERE timestamp < ?", -1, &stmt, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(stmt, 1, cutoff);
-        sqlite3_step(stmt);
+    if (sqlite3_prepare_v2(db, "PRAGMA page_count", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) page_count = sqlite3_column_int64(stmt, 0);
         sqlite3_finalize(stmt);
     }
+    if (sqlite3_prepare_v2(db, "PRAGMA page_size", -1, &stmt, NULL) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) page_size = sqlite3_column_int64(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    if (page_count * page_size < 10 * 1024 * 1024) return;
+
+    /* Delete oldest 25% */
+    sqlite3_exec(db,
+        "DELETE FROM commands WHERE id IN "
+        "(SELECT id FROM commands ORDER BY timestamp ASC, id ASC "
+        "LIMIT (SELECT COUNT(*) / 4 FROM commands))",
+        NULL, NULL, NULL);
     /* Remove orphaned sessions */
     sqlite3_exec(db,
         "DELETE FROM sessions WHERE session_id NOT IN "
@@ -128,7 +138,7 @@ sqlite3 *lh_db_open(void) {
         return NULL;
     }
 
-    prune_old_data(db);
+    prune_if_oversized(db);
 
     return db;
 }
