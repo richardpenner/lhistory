@@ -42,6 +42,7 @@ lh_key lh_input_read(int fd) {
     }
 
     /* Control characters */
+    if (c == 3) { key.type = LH_KEY_ESCAPE; return key; } /* Ctrl+C — exit */
     if (c == '\r' || c == '\n') { key.type = LH_KEY_ENTER; return key; }
     if (c == 127 || c == 8) { key.type = LH_KEY_BACKSPACE; return key; }
     if (c == '\t') { key.type = LH_KEY_TAB; return key; }

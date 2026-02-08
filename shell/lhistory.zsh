@@ -1,8 +1,8 @@
 # lhistory - zsh integration
 # Source this file in your .zshrc: eval "$(lhistory init zsh)"
 
-# Resolve binary path (works both installed and in development)
-_LHISTORY_BIN="${commands[lhistory]:-$(dirname "${(%):-%x}")/../lhistory}"
+# Resolve binary path
+_LHISTORY_BIN="${commands[lhistory]:-lhistory}"
 
 # Generate unique session ID for this shell instance
 if [[ -z "$LHISTORY_SID" ]]; then

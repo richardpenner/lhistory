@@ -1,8 +1,8 @@
 # lhistory - bash integration
 # Source this file in your .bashrc: eval "$(lhistory init bash)"
 
-# Resolve binary path (works both installed and in development)
-_LHISTORY_BIN="$(command -v lhistory 2>/dev/null || echo "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lhistory")"
+# Resolve binary path
+_LHISTORY_BIN="$(command -v lhistory 2>/dev/null || echo lhistory)"
 
 # Generate unique session ID for this shell instance
 if [[ -z "$LHISTORY_SID" ]]; then

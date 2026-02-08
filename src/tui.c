@@ -89,7 +89,31 @@ static void buf_printf(tui_state *s, const char *fmt, ...) {
     va_start(ap, fmt);
     int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
-    if (n > 0) buf_append(s, tmp, n);
+    if (n > 0) {
+        if (n > (int)sizeof(tmp) - 1) n = (int)sizeof(tmp) - 1;
+        buf_append(s, tmp, n);
+    }
+}
+
+/* Strip control characters (prevent terminal escape injection) */
+static void sanitize_command(char *buf, int bufsize) {
+    int j = 0;
+    for (int i = 0; buf[i] && j < bufsize - 1; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c == 0x1b) {
+            /* Skip ESC and any following CSI sequence */
+            if (buf[i + 1] == '[') {
+                i++;
+                while (buf[i + 1] && !((unsigned char)buf[i + 1] >= 0x40 && (unsigned char)buf[i + 1] <= 0x7e))
+                    i++;
+                if (buf[i + 1]) i++; /* skip final byte */
+            }
+            continue;
+        }
+        if (c < 32 && c != '\t') continue; /* strip other control chars */
+        buf[j++] = (char)c;
+    }
+    buf[j] = '\0';
 }
 
 /* Shorten a directory path: ~/projects/foo → ~/p/foo, or keep last component */
@@ -300,10 +324,18 @@ static void render(tui_state *s) {
 
                 char cmd_trunc[256];
                 snprintf(cmd_trunc, sizeof(cmd_trunc), "%s", cmd->command);
+                sanitize_command(cmd_trunc, sizeof(cmd_trunc));
                 int clen = (int)strlen(cmd_trunc);
                 if (clen > cmd_max) {
-                    cmd_trunc[cmd_max - 1] = '\0';
-                    strcat(cmd_trunc, "…");
+                    /* Leave room for "…" (3 bytes UTF-8) + null */
+                    int trunc_at = cmd_max - 1;
+                    if (trunc_at < 0) trunc_at = 0;
+                    if (trunc_at + 4 < (int)sizeof(cmd_trunc)) {
+                        cmd_trunc[trunc_at] = '\0';
+                        strcat(cmd_trunc, "\xe2\x80\xa6"); /* … */
+                    } else {
+                        cmd_trunc[cmd_max] = '\0';
+                    }
                     clen = cmd_max;
                 }
 
@@ -339,6 +371,7 @@ static void render(tui_state *s) {
     if (sel) {
         char preview[512];
         snprintf(preview, sizeof(preview), " %s", sel->command);
+        sanitize_command(preview, sizeof(preview));
         int plen = (int)strlen(preview);
         if (plen > s->size.cols) {
             preview[s->size.cols - 1] = '\0';
@@ -390,18 +423,19 @@ static void load_data(tui_state *s) {
     }
 
     for (int i = 0; i < sessions.count; i++) {
-        s->columns[i].session = &sessions.items[i];
+        /* Copy session into its own allocation so cleanup can free each independently */
+        lh_session *sp = malloc(sizeof(lh_session));
+        *sp = sessions.items[i];
+        s->columns[i].session = sp;
         s->columns[i].commands = lh_db_session_commands(
-            s->db, sessions.items[i].session_id, MAX_COMMANDS_PER_SESSION);
-        s->columns[i].filtered = malloc(
-            (size_t)s->columns[i].commands.count * sizeof(int));
+            s->db, sp->session_id, MAX_COMMANDS_PER_SESSION);
+        int cmd_count = s->columns[i].commands.count;
+        s->columns[i].filtered = cmd_count ? malloc((size_t)cmd_count * sizeof(int)) : NULL;
         s->columns[i].filtered_count = 0;
     }
 
-    /* Note: we keep sessions.items alive (owned by columns[].session) and
-     * free them in cleanup. We just zero out sessions so it isn't double-freed. */
-    sessions.items = NULL;
-    sessions.count = 0;
+    /* Free the contiguous sessions array — strings are now owned by the copied structs */
+    free(sessions.items);
 
     apply_search_filter(s);
 }

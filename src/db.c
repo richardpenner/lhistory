@@ -77,6 +77,26 @@ static int ensure_dir(const char *path) {
     return 0;
 }
 
+static void set_file_permissions(const char *path) {
+    chmod(path, 0600);
+}
+
+static void prune_old_data(sqlite3 *db) {
+    /* Delete commands older than 90 days */
+    int64_t cutoff = now_ms() - (int64_t)90 * 24 * 60 * 60 * 1000;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM commands WHERE timestamp < ?", -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, cutoff);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+    /* Remove orphaned sessions */
+    sqlite3_exec(db,
+        "DELETE FROM sessions WHERE session_id NOT IN "
+        "(SELECT DISTINCT session_id FROM commands)", NULL, NULL, NULL);
+}
+
 sqlite3 *lh_db_open(void) {
     const char *path = lh_db_path();
     if (!path) return NULL;
@@ -89,6 +109,9 @@ sqlite3 *lh_db_open(void) {
         if (db) sqlite3_close(db);
         return NULL;
     }
+
+    /* Restrict file permissions — history may contain sensitive data */
+    set_file_permissions(path);
 
     /* WAL mode for concurrent access */
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
@@ -104,6 +127,8 @@ sqlite3 *lh_db_open(void) {
         sqlite3_close(db);
         return NULL;
     }
+
+    prune_old_data(db);
 
     return db;
 }

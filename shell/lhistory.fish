@@ -1,11 +1,11 @@
 # lhistory - fish integration
 # Source this file in your config.fish: eval (lhistory init fish)
 
-# Resolve binary path (works both installed and in development)
+# Resolve binary path
 if command -sq lhistory
     set -g _LHISTORY_BIN (command -s lhistory)
 else
-    set -g _LHISTORY_BIN (status dirname)/../lhistory
+    set -g _LHISTORY_BIN lhistory
 end
 
 # Generate unique session ID for this shell instance

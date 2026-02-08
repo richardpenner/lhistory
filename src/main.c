@@ -148,8 +148,15 @@ static int cmd_init(const char *shell) {
         if (!all_locations[i]) continue;
         char path[2048];
         snprintf(path, sizeof(path), "%s/%s", all_locations[i], filename);
-        if (access(path, R_OK) == 0) {
-            printf("source '%s'\n", path);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            /* Output file contents directly — avoids path injection via source */
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+                fwrite(buf, 1, n, stdout);
+            }
+            fclose(f);
             return 0;
         }
     }
@@ -164,6 +171,21 @@ static int cmd_install(void) {
     const char *home = getenv("HOME");
     if (!home) { fprintf(stderr, "lhistory: $HOME not set\n"); return 1; }
 
+    /* Resolve our own binary path for the eval line */
+    char bin_path[1024] = "lhistory";
+#ifdef __APPLE__
+    {
+        uint32_t bufsize = sizeof(bin_path);
+        extern int _NSGetExecutablePath(char *, uint32_t *);
+        _NSGetExecutablePath(bin_path, &bufsize);
+    }
+#else
+    {
+        ssize_t n = readlink("/proc/self/exe", bin_path, sizeof(bin_path) - 1);
+        if (n > 0) bin_path[n] = '\0';
+    }
+#endif
+
     /* Detect current shell */
     const char *shell_env = getenv("SHELL");
     if (!shell_env) shell_env = "/bin/zsh";
@@ -171,28 +193,22 @@ static int cmd_install(void) {
     struct {
         const char *name;
         const char *rc;
+        const char *eval_fmt; /* shell-specific eval syntax */
     } shells[] = {
-        {"zsh",  ".zshrc"},
-        {"bash", ".bashrc"},
-        {"fish", ".config/fish/config.fish"},
+        {"zsh",  ".zshrc",                    "\n# lhistory - cross-shell history browser\neval \"$(%s init zsh)\"\n"},
+        {"bash", ".bashrc",                   "\n# lhistory - cross-shell history browser\neval \"$(%s init bash)\"\n"},
+        {"fish", ".config/fish/config.fish",  "\n# lhistory - cross-shell history browser\neval (%s init fish)\n"},
     };
 
     int installed = 0;
     for (int i = 0; i < 3; i++) {
         char rc_path[1024];
-        if (strcmp(shells[i].name, "fish") == 0) {
-            snprintf(rc_path, sizeof(rc_path), "%s/%s", home, shells[i].rc);
-        } else {
-            snprintf(rc_path, sizeof(rc_path), "%s/%s", home, shells[i].rc);
-        }
+        snprintf(rc_path, sizeof(rc_path), "%s/%s", home, shells[i].rc);
 
         /* Only install for shells whose rc files exist, or the current shell */
         if (access(rc_path, F_OK) != 0 && !strstr(shell_env, shells[i].name)) continue;
 
         /* Check if already sourced */
-        char check_cmd[2048];
-        snprintf(check_cmd, sizeof(check_cmd), "lhistory init %s", shells[i].name);
-
         FILE *f = fopen(rc_path, "r");
         int already = 0;
         if (f) {
@@ -213,8 +229,7 @@ static int cmd_install(void) {
             fprintf(stderr, "  %s: cannot write to %s\n", shells[i].name, rc_path);
             continue;
         }
-        fprintf(f, "\n# lhistory - cross-shell history browser\neval \"$(lhistory init %s)\"\n",
-                shells[i].name);
+        fprintf(f, shells[i].eval_fmt, bin_path);
         fclose(f);
         printf("  %s: added to %s\n", shells[i].name, rc_path);
         installed++;
