@@ -1,5 +1,6 @@
+VERSION = 0.1.2
 CC = cc
-CFLAGS = -O2 -Wall -Wextra -pedantic -std=c11
+CFLAGS = -O2 -Wall -Wextra -pedantic -std=c11 -DLHISTORY_VERSION='"$(VERSION)"'
 CFLAGS_SQLITE = -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION
 LDFLAGS = -lpthread
 PREFIX ?= /usr/local

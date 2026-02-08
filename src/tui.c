@@ -229,7 +229,8 @@ static void render(tui_state *s) {
 
     /* === Title bar === */
     {
-        const char *title = " lhistory ";
+        char title[64];
+        snprintf(title, sizeof(title), " lhistory %s ", LHISTORY_VERSION);
         int tlen = (int)strlen(title);
         int pad_left = (s->size.cols - tlen) / 2;
         int pad_right = s->size.cols - tlen - pad_left;
@@ -289,11 +290,12 @@ static void render(tui_state *s) {
     for (int i = used; i < s->size.cols; i++) buf_puts(s, "─");
     buf_puts(s, C_RESET "\r\n");
 
-    /* === Command rows === */
+    /* === Command rows (bottom = newest, top = oldest) === */
     for (int r = 0; r < vis_rows; r++) {
+        int data_row = vis_rows - 1 - r; /* screen bottom = data_row 0 = newest */
         for (int c = 0; c < s->visible_columns; c++) {
-            lh_command *cmd = get_command(s, c, r);
-            int is_selected = (c == s->cur_col && r == s->cur_row);
+            lh_command *cmd = get_command(s, c, data_row);
+            int is_selected = (c == s->cur_col && data_row == s->cur_row);
 
             if (is_selected) {
                 buf_puts(s, C_SEL_BG C_SEL_FG);
@@ -558,22 +560,24 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
         switch (key.type) {
             case LH_KEY_UP:
             case LH_KEY_K:
-                if (state.cur_row > 0) {
-                    state.cur_row--;
-                } else if (state.scroll_offset > 0) {
-                    state.scroll_offset--;
-                }
-                state.needs_redraw = 1;
-                break;
-
-            case LH_KEY_DOWN:
-            case LH_KEY_J:
+                /* Up = back in time (older commands, higher on screen) */
                 if (state.scroll_offset + state.cur_row < max_row) {
                     if (state.cur_row < vis_rows - 1) {
                         state.cur_row++;
                     } else {
                         state.scroll_offset++;
                     }
+                }
+                state.needs_redraw = 1;
+                break;
+
+            case LH_KEY_DOWN:
+            case LH_KEY_J:
+                /* Down = forward in time (newer commands, lower on screen) */
+                if (state.cur_row > 0) {
+                    state.cur_row--;
+                } else if (state.scroll_offset > 0) {
+                    state.scroll_offset--;
                 }
                 state.needs_redraw = 1;
                 break;
@@ -624,18 +628,20 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
                 break;
 
             case LH_KEY_G:
-                state.cur_row = 0;
-                state.scroll_offset = 0;
-                state.needs_redraw = 1;
-                break;
-
-            case LH_KEY_G_SHIFT:
+                /* g = jump to top of screen (oldest) */
                 if (max_row >= vis_rows) {
                     state.scroll_offset = max_row - vis_rows + 1;
                     state.cur_row = vis_rows - 1;
                 } else {
                     state.cur_row = max_row;
                 }
+                state.needs_redraw = 1;
+                break;
+
+            case LH_KEY_G_SHIFT:
+                /* G = jump to bottom of screen (newest) */
+                state.cur_row = 0;
+                state.scroll_offset = 0;
                 state.needs_redraw = 1;
                 break;
 
