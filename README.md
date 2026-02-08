@@ -30,13 +30,13 @@ Cross-shell command history browser. See commands from all your terminal tabs, I
 ### Homebrew
 
 ```
-brew install richardkim/tap/lhistory
+brew install richardpenner/tap/lhistory
 ```
 
 ### From source
 
 ```
-git clone https://github.com/richardkim/lhistory.git
+git clone https://github.com/richardpenner/lhistory.git
 cd lhistory
 make
 sudo make install
