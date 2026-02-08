@@ -1,4 +1,5 @@
 #include "db.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,12 +61,13 @@ const char *lh_db_path(void) {
 static int ensure_dir(const char *path) {
     char tmp[1024];
     snprintf(tmp, sizeof(tmp), "%s", path);
-    /* find last slash to get directory */
     char *slash = strrchr(tmp, '/');
-    if (!slash) return 0;
+    if (!slash) return -1;
     *slash = '\0';
 
-    /* recursive mkdir */
+    struct stat st;
+    if (stat(tmp, &st) == 0) return 0;
+
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
@@ -73,12 +75,8 @@ static int ensure_dir(const char *path) {
             *p = '/';
         }
     }
-    mkdir(tmp, 0755);
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
     return 0;
-}
-
-static void set_file_permissions(const char *path) {
-    chmod(path, 0600);
 }
 
 static void prune_if_oversized(sqlite3 *db) {
@@ -95,7 +93,6 @@ static void prune_if_oversized(sqlite3 *db) {
     }
     if (page_count * page_size < 10 * 1024 * 1024) return;
 
-    /* Delete oldest 25% */
     sqlite3_exec(db,
         "DELETE FROM commands WHERE id IN "
         "(SELECT id FROM commands ORDER BY timestamp ASC, id ASC "
@@ -111,7 +108,12 @@ sqlite3 *lh_db_open(void) {
     const char *path = lh_db_path();
     if (!path) return NULL;
 
-    ensure_dir(path);
+    int is_new = (access(path, F_OK) != 0);
+
+    if (ensure_dir(path) != 0) {
+        fprintf(stderr, "lhistory: cannot create directory for %s\n", path);
+        return NULL;
+    }
 
     sqlite3 *db = NULL;
     int rc = sqlite3_open(path, &db);
@@ -120,15 +122,13 @@ sqlite3 *lh_db_open(void) {
         return NULL;
     }
 
-    /* Restrict file permissions — history may contain sensitive data */
-    set_file_permissions(path);
+    if (is_new) chmod(path, 0600);
 
     /* WAL mode for concurrent access */
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA busy_timeout=1000;", NULL, NULL, NULL);
 
-    /* Create schema */
     char *err = NULL;
     rc = sqlite3_exec(db, SCHEMA_SQL, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
@@ -168,7 +168,6 @@ int lh_db_record(sqlite3 *db, const char *session_id, const char *command,
 
     if (rc != SQLITE_DONE) return rc;
 
-    /* Touch session */
     lh_db_touch_session(db, session_id, shell, ide, directory);
 
     return 0;
@@ -220,24 +219,48 @@ int lh_db_touch_session(sqlite3 *db, const char *session_id, const char *shell,
 }
 
 /* Helper to grow a command list */
-static void cmd_list_push(lh_command_list *list, lh_command *cmd) {
+static int cmd_list_push(lh_command_list *list, lh_command *cmd) {
     if (list->count >= list->capacity) {
-        list->capacity = list->capacity ? list->capacity * 2 : 64;
-        list->items = realloc(list->items, (size_t)list->capacity * sizeof(lh_command));
+        int new_cap = list->capacity ? list->capacity * 2 : 64;
+        lh_command *tmp = realloc(list->items, (size_t)new_cap * sizeof(lh_command));
+        if (!tmp) return -1;
+        list->items = tmp;
+        list->capacity = new_cap;
     }
     list->items[list->count++] = *cmd;
+    return 0;
 }
 
-static void sess_list_push(lh_session_list *list, lh_session *s) {
+static int sess_list_push(lh_session_list *list, lh_session *s) {
     if (list->count >= list->capacity) {
-        list->capacity = list->capacity ? list->capacity * 2 : 16;
-        list->items = realloc(list->items, (size_t)list->capacity * sizeof(lh_session));
+        int new_cap = list->capacity ? list->capacity * 2 : 16;
+        lh_session *tmp = realloc(list->items, (size_t)new_cap * sizeof(lh_session));
+        if (!tmp) return -1;
+        list->items = tmp;
+        list->capacity = new_cap;
     }
     list->items[list->count++] = *s;
+    return 0;
 }
 
 static char *safe_strdup(const char *s) {
     return s ? strdup(s) : NULL;
+}
+
+static lh_command read_command_row(sqlite3_stmt *stmt) {
+    lh_command cmd = {0};
+    cmd.id = sqlite3_column_int64(stmt, 0);
+    cmd.session_id = safe_strdup((const char *)sqlite3_column_text(stmt, 1));
+    cmd.command = safe_strdup((const char *)sqlite3_column_text(stmt, 2));
+    cmd.timestamp = sqlite3_column_int64(stmt, 3);
+    cmd.directory = safe_strdup((const char *)sqlite3_column_text(stmt, 4));
+    if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
+        cmd.exit_code = sqlite3_column_int(stmt, 5);
+        cmd.has_exit_code = 1;
+    }
+    cmd.shell = safe_strdup((const char *)sqlite3_column_text(stmt, 6));
+    cmd.ide = safe_strdup((const char *)sqlite3_column_text(stmt, 7));
+    return cmd;
 }
 
 lh_session_list lh_db_recent_sessions(sqlite3 *db, int limit) {
@@ -274,18 +297,7 @@ lh_command_list lh_db_session_commands(sqlite3 *db, const char *session_id, int 
     sqlite3_bind_int(stmt, 2, limit);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        lh_command cmd = {0};
-        cmd.id = sqlite3_column_int64(stmt, 0);
-        cmd.session_id = safe_strdup((const char *)sqlite3_column_text(stmt, 1));
-        cmd.command = safe_strdup((const char *)sqlite3_column_text(stmt, 2));
-        cmd.timestamp = sqlite3_column_int64(stmt, 3);
-        cmd.directory = safe_strdup((const char *)sqlite3_column_text(stmt, 4));
-        if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
-            cmd.exit_code = sqlite3_column_int(stmt, 5);
-            cmd.has_exit_code = 1;
-        }
-        cmd.shell = safe_strdup((const char *)sqlite3_column_text(stmt, 6));
-        cmd.ide = safe_strdup((const char *)sqlite3_column_text(stmt, 7));
+        lh_command cmd = read_command_row(stmt);
         cmd_list_push(&list, &cmd);
     }
     sqlite3_finalize(stmt);
@@ -302,18 +314,7 @@ lh_command_list lh_db_recent_commands(sqlite3 *db, int limit) {
     sqlite3_bind_int(stmt, 1, limit);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        lh_command cmd = {0};
-        cmd.id = sqlite3_column_int64(stmt, 0);
-        cmd.session_id = safe_strdup((const char *)sqlite3_column_text(stmt, 1));
-        cmd.command = safe_strdup((const char *)sqlite3_column_text(stmt, 2));
-        cmd.timestamp = sqlite3_column_int64(stmt, 3);
-        cmd.directory = safe_strdup((const char *)sqlite3_column_text(stmt, 4));
-        if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
-            cmd.exit_code = sqlite3_column_int(stmt, 5);
-            cmd.has_exit_code = 1;
-        }
-        cmd.shell = safe_strdup((const char *)sqlite3_column_text(stmt, 6));
-        cmd.ide = safe_strdup((const char *)sqlite3_column_text(stmt, 7));
+        lh_command cmd = read_command_row(stmt);
         cmd_list_push(&list, &cmd);
     }
     sqlite3_finalize(stmt);
@@ -323,15 +324,14 @@ lh_command_list lh_db_recent_commands(sqlite3 *db, int limit) {
 lh_command_list lh_db_search(sqlite3 *db, const char *pattern, int limit) {
     lh_command_list list = {0};
 
-    /* Use LIKE with wildcards for simple substring search */
     const char *sql = "SELECT id, session_id, command, timestamp, directory, exit_code, shell, ide "
                       "FROM commands WHERE command LIKE ? ORDER BY timestamp DESC, id DESC LIMIT ?";
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return list;
 
-    /* Build %pattern% */
     size_t plen = strlen(pattern);
     char *like = malloc(plen + 3);
+    if (!like) { sqlite3_finalize(stmt); return list; }
     like[0] = '%';
     memcpy(like + 1, pattern, plen);
     like[plen + 1] = '%';
@@ -341,18 +341,7 @@ lh_command_list lh_db_search(sqlite3 *db, const char *pattern, int limit) {
     sqlite3_bind_int(stmt, 2, limit);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        lh_command cmd = {0};
-        cmd.id = sqlite3_column_int64(stmt, 0);
-        cmd.session_id = safe_strdup((const char *)sqlite3_column_text(stmt, 1));
-        cmd.command = safe_strdup((const char *)sqlite3_column_text(stmt, 2));
-        cmd.timestamp = sqlite3_column_int64(stmt, 3);
-        cmd.directory = safe_strdup((const char *)sqlite3_column_text(stmt, 4));
-        if (sqlite3_column_type(stmt, 5) != SQLITE_NULL) {
-            cmd.exit_code = sqlite3_column_int(stmt, 5);
-            cmd.has_exit_code = 1;
-        }
-        cmd.shell = safe_strdup((const char *)sqlite3_column_text(stmt, 6));
-        cmd.ide = safe_strdup((const char *)sqlite3_column_text(stmt, 7));
+        lh_command cmd = read_command_row(stmt);
         cmd_list_push(&list, &cmd);
     }
     sqlite3_finalize(stmt);

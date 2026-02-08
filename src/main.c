@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 static void usage(void) {
     fprintf(stderr,
@@ -91,21 +94,17 @@ static int cmd_browse(void) {
 }
 
 static int cmd_init(const char *shell) {
-    /* Find the shell integration directory */
-    /* Check a few locations: next to the binary, /usr/local/share/lhistory, etc. */
     const char *locations[] = {
         NULL, /* filled in with binary dir */
         "/usr/local/share/lhistory",
         "/opt/homebrew/share/lhistory",
     };
 
-    /* Get binary directory */
     char self_path[1024] = {0};
     char shell_dir[1024] = {0};
 
 #ifdef __APPLE__
     uint32_t bufsize = sizeof(self_path);
-    extern int _NSGetExecutablePath(char *, uint32_t *);
     if (_NSGetExecutablePath(self_path, &bufsize) == 0) {
         char *slash = strrchr(self_path, '/');
         if (slash) {
@@ -171,12 +170,10 @@ static int cmd_install(void) {
     const char *home = getenv("HOME");
     if (!home) { fprintf(stderr, "lhistory: $HOME not set\n"); return 1; }
 
-    /* Resolve our own binary path for the eval line */
     char bin_path[1024] = "lhistory";
 #ifdef __APPLE__
     {
         uint32_t bufsize = sizeof(bin_path);
-        extern int _NSGetExecutablePath(char *, uint32_t *);
         _NSGetExecutablePath(bin_path, &bufsize);
     }
 #else
@@ -186,7 +183,6 @@ static int cmd_install(void) {
     }
 #endif
 
-    /* Detect current shell */
     const char *shell_env = getenv("SHELL");
     if (!shell_env) shell_env = "/bin/zsh";
 
@@ -267,6 +263,9 @@ int main(int argc, char **argv) {
         return cmd_install();
     } else if (strcmp(subcmd, "--help") == 0 || strcmp(subcmd, "-h") == 0) {
         usage();
+        return 0;
+    } else if (strcmp(subcmd, "--version") == 0 || strcmp(subcmd, "-v") == 0) {
+        printf("lhistory %s\n", LHISTORY_VERSION);
         return 0;
     } else {
         fprintf(stderr, "lhistory: unknown command '%s'\n", subcmd);

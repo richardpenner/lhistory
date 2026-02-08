@@ -14,7 +14,6 @@
 #define SEARCH_BUF_SIZE 256
 #define RENDER_BUF_SIZE (64 * 1024)
 
-/* Color scheme */
 #define C_RESET    "\x1b[0m"
 #define C_BOLD     "\x1b[1m"
 #define C_DIM      "\x1b[2m"
@@ -166,6 +165,7 @@ static void shorten_dir(const char *dir, char *out, int maxlen) {
 static void format_time(int64_t ts_ms, char *out, int maxlen) {
     time_t ts = (time_t)(ts_ms / 1000);
     struct tm *tm = localtime(&ts);
+    if (!tm) { snprintf(out, (size_t)maxlen, "--:--:--"); return; }
     snprintf(out, (size_t)maxlen, "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
@@ -212,8 +212,9 @@ static void render(tui_state *s) {
     /* Clear screen, home cursor */
     buf_puts(s, "\x1b[H\x1b[2J");
 
-    /* Recalculate visible columns */
-    s->col_width = s->size.cols / (s->size.cols / MIN_COL_WIDTH);
+    int divisor = s->size.cols / MIN_COL_WIDTH;
+    if (divisor < 1) divisor = 1;
+    s->col_width = s->size.cols / divisor;
     if (s->col_width < MIN_COL_WIDTH) s->col_width = MIN_COL_WIDTH;
     s->visible_columns = s->size.cols / s->col_width;
     if (s->visible_columns > s->num_columns) s->visible_columns = s->num_columns;
@@ -427,6 +428,7 @@ static void load_data(tui_state *s) {
     for (int i = 0; i < sessions.count; i++) {
         /* Copy session into its own allocation so cleanup can free each independently */
         lh_session *sp = malloc(sizeof(lh_session));
+        if (!sp) { s->num_columns = i; break; }
         *sp = sessions.items[i];
         s->columns[i].session = sp;
         s->columns[i].commands = lh_db_session_commands(
