@@ -76,6 +76,7 @@ typedef struct {
     int origin_row;
     int tui_height;
     int left_pad;
+    int sel_highlight_w;
 } tui_state;
 
 static tui_state *g_state = NULL;
@@ -252,7 +253,7 @@ static void format_hour(int h, char *buf, int bufsize) {
     else snprintf(buf, bufsize, "%dpm", h - 12);
 }
 
-static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) {
+static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected, int avail_width) {
     char timebuf[16];
     format_time(cmd->timestamp, timebuf, sizeof(timebuf));
 
@@ -269,8 +270,10 @@ static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) 
     }
 
     int time_width = 9;
-    int cmd_max = s->col_width - time_width - 2;
-    if (cmd_max < 1) cmd_max = 1;
+    int col_cmd = s->col_width - time_width - 1 - s->left_pad;
+    if (col_cmd < 1) col_cmd = 1;
+    int cmd_max = avail_width - time_width - 1 - s->left_pad;
+    if (cmd_max < col_cmd) cmd_max = col_cmd;
 
     char cmd_trunc[256];
     snprintf(cmd_trunc, sizeof(cmd_trunc), "%s", cmd->command);
@@ -288,30 +291,40 @@ static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) 
         clen = cmd_max;
     }
 
-    if (!is_selected) buf_puts(s, C_TIME_FG);
+    buf_puts(s, C_TIME_FG);
     buf_printf(s, "%s ", timebuf);
-    if (!is_selected && exit_color[0]) buf_puts(s, exit_color);
+    if (exit_color[0]) buf_puts(s, exit_color);
     buf_printf(s, "%c", exit_indicator);
-    if (!is_selected) buf_puts(s, C_RESET);
-    buf_printf(s, "%-*s", cmd_max, cmd_trunc);
-}
+    buf_puts(s, C_RESET);
 
-static void buf_pad_left(tui_state *s) {
     for (int i = 0; i < s->left_pad; i++) buf_puts(s, " ");
+    if (is_selected) {
+        int hw = s->sel_highlight_w;
+        if (hw > cmd_max) hw = cmd_max;
+        buf_puts(s, C_SEL_BG C_SEL_FG);
+        buf_printf(s, "%-*s", hw, cmd_trunc);
+        buf_puts(s, C_RESET);
+        int remain = cmd_max - hw;
+        if (remain > 0) {
+            int printed = (int)strlen(cmd_trunc);
+            if (printed < hw) printed = hw;
+            if (printed < cmd_max)
+                buf_printf(s, "%*s", cmd_max - printed, "");
+        }
+    } else {
+        buf_printf(s, "%-*s", cmd_max, cmd_trunc);
+    }
 }
 
 static void render(tui_state *s) {
     s->render_len = 0;
     buf_printf(s, "\x1b[%d;1H", s->origin_row);
 
-    int cols = s->size.cols - s->left_pad;
-    if (cols < MIN_COL_WIDTH) cols = MIN_COL_WIDTH;
-
-    int divisor = cols / MIN_COL_WIDTH;
+    int divisor = s->size.cols / MIN_COL_WIDTH;
     if (divisor < 1) divisor = 1;
-    s->col_width = cols / divisor;
+    s->col_width = s->size.cols / divisor;
     if (s->col_width < MIN_COL_WIDTH) s->col_width = MIN_COL_WIDTH;
-    s->visible_columns = cols / s->col_width;
+    s->visible_columns = s->size.cols / s->col_width;
     if (s->visible_columns > s->num_columns) s->visible_columns = s->num_columns;
     if (s->visible_columns < 1) s->visible_columns = 1;
 
@@ -391,14 +404,13 @@ static void render(tui_state *s) {
             for (int i = 0; i < nseg; i++) {
                 int sep = (i == 0) ? 0 : 3;
                 int need = seg_lens[i] + sep;
-                if (tlen + 2 + stats_width + need > cols) break;
+                if (tlen + 2 + stats_width + need > s->size.cols) break;
                 stats_width += need;
                 fit++;
             }
 
-            buf_pad_left(s);
             if (fit > 0) {
-                int gap = cols - tlen - stats_width - 1;
+                int gap = s->size.cols - tlen - stats_width - 1;
                 buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
                 buf_puts(s, title);
                 for (int i = 0; i < gap; i++) buf_puts(s, " ");
@@ -409,17 +421,16 @@ static void render(tui_state *s) {
                 }
                 buf_puts(s, " ");
             } else {
-                int pad_l = (cols - tlen) / 2;
-                int pad_r = cols - tlen - pad_l;
+                int pad_l = (s->size.cols - tlen) / 2;
+                int pad_r = s->size.cols - tlen - pad_l;
                 buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
                 for (int i = 0; i < pad_l; i++) buf_puts(s, " ");
                 buf_puts(s, title);
                 for (int i = 0; i < pad_r; i++) buf_puts(s, " ");
             }
         } else {
-            buf_pad_left(s);
-            int pad_l = (cols - tlen) / 2;
-            int pad_r = cols - tlen - pad_l;
+            int pad_l = (s->size.cols - tlen) / 2;
+            int pad_r = s->size.cols - tlen - pad_l;
             buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
             for (int i = 0; i < pad_l; i++) buf_puts(s, " ");
             buf_puts(s, title);
@@ -429,7 +440,6 @@ static void render(tui_state *s) {
     }
 
     /* === Header row === */
-    buf_pad_left(s);
     buf_puts(s, C_HEADER_BG);
     for (int c = 0; c < s->visible_columns; c++) {
         int abs_c = s->col_offset + c;
@@ -462,17 +472,27 @@ static void render(tui_state *s) {
         buf_printf(s, " %-*s", s->col_width - 1, header);
         buf_puts(s, C_RESET C_HEADER_BG);
     }
-    for (int i = used; i < cols; i++) buf_puts(s, " ");
+    for (int i = used; i < s->size.cols; i++) buf_puts(s, " ");
     buf_puts(s, C_RESET "\r\n");
 
     /* === Border line === */
-    buf_pad_left(s);
     buf_puts(s, C_BORDER);
     for (int c = 0; c < s->visible_columns; c++) {
         for (int i = 0; i < s->col_width; i++) buf_puts(s, "\xe2\x94\x80");
     }
-    for (int i = used; i < cols; i++) buf_puts(s, "\xe2\x94\x80");
+    for (int i = used; i < s->size.cols; i++) buf_puts(s, "\xe2\x94\x80");
     buf_puts(s, C_RESET "\r\n");
+
+    /* === Compute highlight width from longest command in active column === */
+    s->sel_highlight_w = 0;
+    if (active_abs_col >= 0) {
+        for (int i = 0; i < s->merged_count; i++) {
+            if (s->merged[i].col_idx == active_abs_col) {
+                int len = (int)strlen(s->merged[i].cmd->command);
+                if (len > s->sel_highlight_w) s->sel_highlight_w = len;
+            }
+        }
+    }
 
     /* === Command rows (merged timeline: bottom = newest) === */
     for (int r = 0; r < vis_rows; r++) {
@@ -481,32 +501,27 @@ static void render(tui_state *s) {
         merged_row *entry = (merged_idx < s->merged_count) ? &s->merged[merged_idx] : NULL;
         int is_cursor_row = (data_row == s->cur_row);
 
-        buf_pad_left(s);
+        int filled = 0;
         for (int c = 0; c < s->visible_columns; c++) {
             int abs_c = s->col_offset + c;
             int has_cmd = (entry && entry->col_idx == abs_c);
             int is_selected = (is_cursor_row && has_cmd);
 
-            if (is_selected) {
-                buf_puts(s, C_SEL_BG C_SEL_FG);
-            }
-
             if (has_cmd) {
-                render_command_cell(s, entry->cmd, is_selected);
+                int avail = s->size.cols - c * s->col_width;
+                render_command_cell(s, entry->cmd, is_selected, avail);
+                filled = s->size.cols;
+                break;
             } else {
                 buf_printf(s, "%-*s", s->col_width, "");
-            }
-
-            if (is_selected) {
-                buf_puts(s, C_RESET);
+                filled += s->col_width;
             }
         }
-        for (int i = used; i < cols; i++) buf_puts(s, " ");
+        for (int i = filled; i < s->size.cols; i++) buf_puts(s, " ");
         buf_puts(s, "\r\n");
     }
 
     /* === Status bar === */
-    buf_pad_left(s);
     buf_puts(s, C_STATUS_BG C_STATUS_FG);
     {
         lh_command *sel = NULL;
@@ -518,30 +533,29 @@ static void render(tui_state *s) {
             snprintf(preview, sizeof(preview), " %s", sel->command);
             sanitize_command(preview, sizeof(preview));
             int plen = (int)strlen(preview);
-            if (plen > cols) {
-                preview[cols - 1] = '\0';
+            if (plen > s->size.cols) {
+                preview[s->size.cols - 1] = '\0';
             }
-            buf_printf(s, "%-*s", cols, preview);
+            buf_printf(s, "%-*s", s->size.cols, preview);
         } else {
-            buf_printf(s, "%-*s", cols, "");
+            buf_printf(s, "%-*s", s->size.cols, "");
         }
     }
     buf_puts(s, C_RESET "\r\n");
 
-    buf_pad_left(s);
     buf_puts(s, C_STATUS_BG);
     if (s->mode == MODE_SEARCH) {
         buf_puts(s, C_SEARCH_FG);
         buf_printf(s, " /%s", s->search_buf);
         buf_puts(s, "\xe2\x96\x88");
-        int fill = cols - s->search_len - 3;
+        int fill = s->size.cols - s->search_len - 3;
         for (int i = 0; i < fill; i++) buf_puts(s, " ");
     } else {
         buf_puts(s, C_STATUS_FG C_DIM);
         char help[] = " \xe2\x86\x91\xe2\x86\x93/jk:navigate  \xe2\x86\x90\xe2\x86\x92/hl:sessions  /:search  Enter:select  q/Esc:quit";
         int hlen = (int)strlen(help);
-        if (hlen > cols) help[cols] = '\0';
-        buf_printf(s, "%-*s", cols, help);
+        if (hlen > s->size.cols) help[s->size.cols] = '\0';
+        buf_printf(s, "%-*s", s->size.cols, help);
     }
     buf_puts(s, C_RESET);
 
