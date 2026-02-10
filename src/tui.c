@@ -1,12 +1,16 @@
 #include "tui.h"
 #include "term.h"
 #include "input.h"
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/select.h>
+#include <termios.h>
 #include <time.h>
+#include <unistd.h>
 
 #define MIN_TUI_ROWS 10
 #define MIN_COL_WIDTH 28
@@ -71,6 +75,7 @@ typedef struct {
     int stats_ready;
     int origin_row;
     int tui_height;
+    int left_pad;
 } tui_state;
 
 static tui_state *g_state = NULL;
@@ -78,14 +83,8 @@ static tui_state *g_state = NULL;
 static void resize_handler(void) {
     if (g_state) {
         g_state->size = lh_term_get_size();
-        if (g_state->origin_row + g_state->tui_height > g_state->size.rows) {
-            g_state->tui_height = g_state->size.rows - g_state->origin_row + 1;
-            if (g_state->tui_height < MIN_TUI_ROWS)
-                g_state->tui_height = MIN_TUI_ROWS;
-            if (g_state->origin_row + g_state->tui_height - 1 > g_state->size.rows)
-                g_state->origin_row = g_state->size.rows - g_state->tui_height + 1;
-            if (g_state->origin_row < 1) g_state->origin_row = 1;
-        }
+        if (g_state->tui_height > g_state->size.rows)
+            g_state->tui_height = g_state->size.rows;
         g_state->needs_redraw = 1;
     }
 }
@@ -297,15 +296,22 @@ static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) 
     buf_printf(s, "%-*s", cmd_max, cmd_trunc);
 }
 
+static void buf_pad_left(tui_state *s) {
+    for (int i = 0; i < s->left_pad; i++) buf_puts(s, " ");
+}
+
 static void render(tui_state *s) {
     s->render_len = 0;
     buf_printf(s, "\x1b[%d;1H", s->origin_row);
 
-    int divisor = s->size.cols / MIN_COL_WIDTH;
+    int cols = s->size.cols - s->left_pad;
+    if (cols < MIN_COL_WIDTH) cols = MIN_COL_WIDTH;
+
+    int divisor = cols / MIN_COL_WIDTH;
     if (divisor < 1) divisor = 1;
-    s->col_width = s->size.cols / divisor;
+    s->col_width = cols / divisor;
     if (s->col_width < MIN_COL_WIDTH) s->col_width = MIN_COL_WIDTH;
-    s->visible_columns = s->size.cols / s->col_width;
+    s->visible_columns = cols / s->col_width;
     if (s->visible_columns > s->num_columns) s->visible_columns = s->num_columns;
     if (s->visible_columns < 1) s->visible_columns = 1;
 
@@ -385,13 +391,14 @@ static void render(tui_state *s) {
             for (int i = 0; i < nseg; i++) {
                 int sep = (i == 0) ? 0 : 3;
                 int need = seg_lens[i] + sep;
-                if (tlen + 2 + stats_width + need > s->size.cols) break;
+                if (tlen + 2 + stats_width + need > cols) break;
                 stats_width += need;
                 fit++;
             }
 
+            buf_pad_left(s);
             if (fit > 0) {
-                int gap = s->size.cols - tlen - stats_width - 1;
+                int gap = cols - tlen - stats_width - 1;
                 buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
                 buf_puts(s, title);
                 for (int i = 0; i < gap; i++) buf_puts(s, " ");
@@ -402,25 +409,27 @@ static void render(tui_state *s) {
                 }
                 buf_puts(s, " ");
             } else {
-                int pad_left = (s->size.cols - tlen) / 2;
-                int pad_right = s->size.cols - tlen - pad_left;
+                int pad_l = (cols - tlen) / 2;
+                int pad_r = cols - tlen - pad_l;
                 buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
-                for (int i = 0; i < pad_left; i++) buf_puts(s, " ");
+                for (int i = 0; i < pad_l; i++) buf_puts(s, " ");
                 buf_puts(s, title);
-                for (int i = 0; i < pad_right; i++) buf_puts(s, " ");
+                for (int i = 0; i < pad_r; i++) buf_puts(s, " ");
             }
         } else {
-            int pad_left = (s->size.cols - tlen) / 2;
-            int pad_right = s->size.cols - tlen - pad_left;
+            buf_pad_left(s);
+            int pad_l = (cols - tlen) / 2;
+            int pad_r = cols - tlen - pad_l;
             buf_puts(s, "\x1b[48;5;24m\x1b[38;5;255m" C_BOLD);
-            for (int i = 0; i < pad_left; i++) buf_puts(s, " ");
+            for (int i = 0; i < pad_l; i++) buf_puts(s, " ");
             buf_puts(s, title);
-            for (int i = 0; i < pad_right; i++) buf_puts(s, " ");
+            for (int i = 0; i < pad_r; i++) buf_puts(s, " ");
         }
         buf_puts(s, C_RESET "\r\n");
     }
 
     /* === Header row === */
+    buf_pad_left(s);
     buf_puts(s, C_HEADER_BG);
     for (int c = 0; c < s->visible_columns; c++) {
         int abs_c = s->col_offset + c;
@@ -453,15 +462,16 @@ static void render(tui_state *s) {
         buf_printf(s, " %-*s", s->col_width - 1, header);
         buf_puts(s, C_RESET C_HEADER_BG);
     }
-    for (int i = used; i < s->size.cols; i++) buf_puts(s, " ");
+    for (int i = used; i < cols; i++) buf_puts(s, " ");
     buf_puts(s, C_RESET "\r\n");
 
     /* === Border line === */
+    buf_pad_left(s);
     buf_puts(s, C_BORDER);
     for (int c = 0; c < s->visible_columns; c++) {
         for (int i = 0; i < s->col_width; i++) buf_puts(s, "\xe2\x94\x80");
     }
-    for (int i = used; i < s->size.cols; i++) buf_puts(s, "\xe2\x94\x80");
+    for (int i = used; i < cols; i++) buf_puts(s, "\xe2\x94\x80");
     buf_puts(s, C_RESET "\r\n");
 
     /* === Command rows (merged timeline: bottom = newest) === */
@@ -471,6 +481,7 @@ static void render(tui_state *s) {
         merged_row *entry = (merged_idx < s->merged_count) ? &s->merged[merged_idx] : NULL;
         int is_cursor_row = (data_row == s->cur_row);
 
+        buf_pad_left(s);
         for (int c = 0; c < s->visible_columns; c++) {
             int abs_c = s->col_offset + c;
             int has_cmd = (entry && entry->col_idx == abs_c);
@@ -490,11 +501,12 @@ static void render(tui_state *s) {
                 buf_puts(s, C_RESET);
             }
         }
-        for (int i = used; i < s->size.cols; i++) buf_puts(s, " ");
+        for (int i = used; i < cols; i++) buf_puts(s, " ");
         buf_puts(s, "\r\n");
     }
 
     /* === Status bar === */
+    buf_pad_left(s);
     buf_puts(s, C_STATUS_BG C_STATUS_FG);
     {
         lh_command *sel = NULL;
@@ -506,29 +518,30 @@ static void render(tui_state *s) {
             snprintf(preview, sizeof(preview), " %s", sel->command);
             sanitize_command(preview, sizeof(preview));
             int plen = (int)strlen(preview);
-            if (plen > s->size.cols) {
-                preview[s->size.cols - 1] = '\0';
+            if (plen > cols) {
+                preview[cols - 1] = '\0';
             }
-            buf_printf(s, "%-*s", s->size.cols, preview);
+            buf_printf(s, "%-*s", cols, preview);
         } else {
-            buf_printf(s, "%-*s", s->size.cols, "");
+            buf_printf(s, "%-*s", cols, "");
         }
     }
     buf_puts(s, C_RESET "\r\n");
 
+    buf_pad_left(s);
     buf_puts(s, C_STATUS_BG);
     if (s->mode == MODE_SEARCH) {
         buf_puts(s, C_SEARCH_FG);
         buf_printf(s, " /%s", s->search_buf);
         buf_puts(s, "\xe2\x96\x88");
-        int fill = s->size.cols - s->search_len - 3;
+        int fill = cols - s->search_len - 3;
         for (int i = 0; i < fill; i++) buf_puts(s, " ");
     } else {
         buf_puts(s, C_STATUS_FG C_DIM);
         char help[] = " \xe2\x86\x91\xe2\x86\x93/jk:navigate  \xe2\x86\x90\xe2\x86\x92/hl:sessions  /:search  Enter:select  q/Esc:quit";
         int hlen = (int)strlen(help);
-        if (hlen > s->size.cols) help[s->size.cols] = '\0';
-        buf_printf(s, "%-*s", s->size.cols, help);
+        if (hlen > cols) help[cols] = '\0';
+        buf_printf(s, "%-*s", cols, help);
     }
     buf_puts(s, C_RESET);
 
@@ -587,38 +600,56 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
     state.current_session_id = current_session_id;
     g_state = &state;
 
+    int tty_fd = open("/dev/tty", O_RDWR);
+    if (tty_fd < 0) return 0;
+
+    int cursor_row = 0, cursor_col = 0;
+    {
+        struct termios old, tmp;
+        tcgetattr(tty_fd, &old);
+        tmp = old;
+        tmp.c_lflag &= ~(unsigned long)(ECHO | ICANON);
+        tmp.c_cc[VMIN] = 1;
+        tmp.c_cc[VTIME] = 0;
+        tcsetattr(tty_fd, TCSAFLUSH, &tmp);
+
+        (void)write(tty_fd, "\x1b[6n", 4);
+        char buf[32];
+        int pos = 0;
+        for (;;) {
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(tty_fd, &fds);
+            struct timeval tv = {0, 100000};
+            if (select(tty_fd + 1, &fds, NULL, NULL, &tv) <= 0) break;
+            if (read(tty_fd, &buf[pos], 1) != 1) break;
+            if (buf[pos] == 'R') { buf[pos + 1] = '\0'; break; }
+            if (++pos >= (int)sizeof(buf) - 1) break;
+        }
+        for (int i = 0; i <= pos; i++) {
+            if (buf[i] == '[') cursor_row = atoi(&buf[i + 1]);
+            if (buf[i] == ';') cursor_col = atoi(&buf[i + 1]);
+        }
+
+        tcsetattr(tty_fd, TCSAFLUSH, &old);
+        close(tty_fd);
+    }
+
     int fd = lh_term_raw_enter();
     if (fd < 0) return 0;
 
     lh_term_on_resize(resize_handler);
     state.size = lh_term_get_size();
 
-    int cursor_row = state.size.rows;
-    int cursor_col = 1;
-    lh_term_query_cursor(&cursor_row, &cursor_col);
-
-    state.tui_height = cursor_row - 1;
-    if (state.tui_height > state.size.rows - 1)
-        state.tui_height = state.size.rows - 1;
-
-    if (state.tui_height < MIN_TUI_ROWS) {
-        int need = MIN_TUI_ROWS - state.tui_height;
-        for (int i = 0; i < need; i++)
-            lh_term_puts("\n");
+    if (cursor_row < 1) cursor_row = state.size.rows;
+    int cmd_text_offset = 10;
+    state.left_pad = (cursor_col > cmd_text_offset + 1) ? cursor_col - cmd_text_offset - 1 : 0;
+    state.origin_row = 1;
+    state.tui_height = cursor_row + 2;
+    if (state.tui_height < MIN_TUI_ROWS)
         state.tui_height = MIN_TUI_ROWS;
-    }
-
-    {
-        char seq[32];
-        snprintf(seq, sizeof(seq), "\x1b[%dA", state.tui_height);
-        lh_term_puts(seq);
-    }
-
-    state.origin_row = cursor_row - state.tui_height;
-    if (lh_term_query_cursor(&state.origin_row, &cursor_col) != 0) {
-        state.origin_row = state.size.rows - state.tui_height + 1;
-    }
-    if (state.origin_row < 1) state.origin_row = 1;
+    if (state.tui_height > state.size.rows)
+        state.tui_height = state.size.rows;
 
     load_data(&state);
 
@@ -840,16 +871,6 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
             default:
                 break;
         }
-    }
-
-    {
-        char seq[32];
-        snprintf(seq, sizeof(seq), "\x1b[%d;1H", state.origin_row);
-        lh_term_puts(seq);
-        for (int i = 0; i < state.tui_height; i++)
-            lh_term_puts("\x1b[2K\n");
-        snprintf(seq, sizeof(seq), "\x1b[%d;1H", state.origin_row);
-        lh_term_puts(seq);
     }
 
     lh_term_raw_exit();
