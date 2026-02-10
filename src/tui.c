@@ -8,6 +8,7 @@
 #include <strings.h>
 #include <time.h>
 
+#define MIN_TUI_ROWS 10
 #define MIN_COL_WIDTH 28
 #define MAX_SESSIONS 16
 #define MAX_COMMANDS_PER_SESSION 500
@@ -68,6 +69,8 @@ typedef struct {
     int merged_count;
     lh_db_stats stats;
     int stats_ready;
+    int origin_row;
+    int tui_height;
 } tui_state;
 
 static tui_state *g_state = NULL;
@@ -75,6 +78,14 @@ static tui_state *g_state = NULL;
 static void resize_handler(void) {
     if (g_state) {
         g_state->size = lh_term_get_size();
+        if (g_state->origin_row + g_state->tui_height > g_state->size.rows) {
+            g_state->tui_height = g_state->size.rows - g_state->origin_row + 1;
+            if (g_state->tui_height < MIN_TUI_ROWS)
+                g_state->tui_height = MIN_TUI_ROWS;
+            if (g_state->origin_row + g_state->tui_height - 1 > g_state->size.rows)
+                g_state->origin_row = g_state->size.rows - g_state->tui_height + 1;
+            if (g_state->origin_row < 1) g_state->origin_row = 1;
+        }
         g_state->needs_redraw = 1;
     }
 }
@@ -225,7 +236,7 @@ static void apply_search_filter(tui_state *s) {
 }
 
 static int max_visible_rows(tui_state *s) {
-    int rows = s->size.rows - 5;
+    int rows = s->tui_height - 5;
     return rows > 0 ? rows : 1;
 }
 
@@ -288,7 +299,7 @@ static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) 
 
 static void render(tui_state *s) {
     s->render_len = 0;
-    buf_puts(s, "\x1b[H\x1b[2J");
+    buf_printf(s, "\x1b[%d;1H", s->origin_row);
 
     int divisor = s->size.cols / MIN_COL_WIDTH;
     if (divisor < 1) divisor = 1;
@@ -582,6 +593,33 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
     lh_term_on_resize(resize_handler);
     state.size = lh_term_get_size();
 
+    int cursor_row = state.size.rows;
+    int cursor_col = 1;
+    lh_term_query_cursor(&cursor_row, &cursor_col);
+
+    state.tui_height = cursor_row - 1;
+    if (state.tui_height > state.size.rows - 1)
+        state.tui_height = state.size.rows - 1;
+
+    if (state.tui_height < MIN_TUI_ROWS) {
+        int need = MIN_TUI_ROWS - state.tui_height;
+        for (int i = 0; i < need; i++)
+            lh_term_puts("\n");
+        state.tui_height = MIN_TUI_ROWS;
+    }
+
+    {
+        char seq[32];
+        snprintf(seq, sizeof(seq), "\x1b[%dA", state.tui_height);
+        lh_term_puts(seq);
+    }
+
+    state.origin_row = cursor_row - state.tui_height;
+    if (lh_term_query_cursor(&state.origin_row, &cursor_col) != 0) {
+        state.origin_row = state.size.rows - state.tui_height + 1;
+    }
+    if (state.origin_row < 1) state.origin_row = 1;
+
     load_data(&state);
 
     if (state.num_columns == 0) {
@@ -802,6 +840,16 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
             default:
                 break;
         }
+    }
+
+    {
+        char seq[32];
+        snprintf(seq, sizeof(seq), "\x1b[%d;1H", state.origin_row);
+        lh_term_puts(seq);
+        for (int i = 0; i < state.tui_height; i++)
+            lh_term_puts("\x1b[2K\n");
+        snprintf(seq, sizeof(seq), "\x1b[%d;1H", state.origin_row);
+        lh_term_puts(seq);
     }
 
     lh_term_raw_exit();

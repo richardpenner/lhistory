@@ -2,8 +2,10 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -43,10 +45,7 @@ int lh_term_raw_enter(void) {
 
     raw_mode_active = 1;
 
-    /* Hide cursor */
     lh_term_puts("\x1b[?25l");
-    /* Switch to alternate screen buffer */
-    lh_term_puts("\x1b[?1049h");
 
     return tty_fd;
 }
@@ -54,9 +53,6 @@ int lh_term_raw_enter(void) {
 void lh_term_raw_exit(void) {
     if (!raw_mode_active) return;
 
-    /* Switch back from alternate screen buffer */
-    lh_term_puts("\x1b[?1049l");
-    /* Show cursor */
     lh_term_puts("\x1b[?25h");
 
     tcsetattr(tty_fd, TCSAFLUSH, &orig_termios);
@@ -88,6 +84,36 @@ void lh_term_write(const char *buf, int len) {
 
 void lh_term_puts(const char *s) {
     lh_term_write(s, (int)strlen(s));
+}
+
+int lh_term_query_cursor(int *row, int *col) {
+    if (tty_fd < 0) return -1;
+    if (write(tty_fd, "\x1b[6n", 4) != 4) return -1;
+
+    char buf[32];
+    int pos = 0;
+    for (;;) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(tty_fd, &fds);
+        struct timeval tv = {0, 100000};
+        if (select(tty_fd + 1, &fds, NULL, NULL, &tv) <= 0) return -1;
+        if (read(tty_fd, &buf[pos], 1) != 1) return -1;
+        if (buf[pos] == 'R') break;
+        if (++pos >= (int)sizeof(buf) - 1) return -1;
+    }
+    buf[pos + 1] = '\0';
+
+    int r = 0, c = 0;
+    char *semi = NULL;
+    for (int i = 0; i <= pos; i++) {
+        if (buf[i] == '[') { r = atoi(&buf[i + 1]); }
+        if (buf[i] == ';') { semi = &buf[i]; c = atoi(&buf[i + 1]); }
+    }
+    if (!semi || r < 1 || c < 1) return -1;
+    *row = r;
+    *col = c;
+    return 0;
 }
 
 void lh_term_on_resize(void (*callback)(void)) {
