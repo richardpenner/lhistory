@@ -483,44 +483,6 @@ static void render(tui_state *s) {
     for (int i = used; i < s->size.cols; i++) buf_puts(s, "\xe2\x94\x80");
     buf_puts(s, C_RESET "\r\n");
 
-    /* === Compute highlight width from longest command in active column === */
-    s->sel_highlight_w = 0;
-    if (active_abs_col >= 0) {
-        for (int i = 0; i < s->merged_count; i++) {
-            if (s->merged[i].col_idx == active_abs_col) {
-                int len = (int)strlen(s->merged[i].cmd->command);
-                if (len > s->sel_highlight_w) s->sel_highlight_w = len;
-            }
-        }
-    }
-
-    /* === Command rows (merged timeline: bottom = newest) === */
-    for (int r = 0; r < vis_rows; r++) {
-        int data_row = vis_rows - 1 - r;
-        int merged_idx = s->scroll_offset + data_row;
-        merged_row *entry = (merged_idx < s->merged_count) ? &s->merged[merged_idx] : NULL;
-        int is_cursor_row = (data_row == s->cur_row);
-
-        int filled = 0;
-        for (int c = 0; c < s->visible_columns; c++) {
-            int abs_c = s->col_offset + c;
-            int has_cmd = (entry && entry->col_idx == abs_c);
-            int is_selected = (is_cursor_row && has_cmd);
-
-            if (has_cmd) {
-                int avail = s->size.cols - c * s->col_width;
-                render_command_cell(s, entry->cmd, is_selected, avail);
-                filled = s->size.cols;
-                break;
-            } else {
-                buf_printf(s, "%-*s", s->col_width, "");
-                filled += s->col_width;
-            }
-        }
-        for (int i = filled; i < s->size.cols; i++) buf_puts(s, " ");
-        buf_puts(s, "\r\n");
-    }
-
     /* === Status bar === */
     buf_puts(s, C_STATUS_BG C_STATUS_FG);
     {
@@ -557,7 +519,45 @@ static void render(tui_state *s) {
         if (hlen > s->size.cols) help[s->size.cols] = '\0';
         buf_printf(s, "%-*s", s->size.cols, help);
     }
-    buf_puts(s, C_RESET);
+    buf_puts(s, C_RESET "\r\n");
+
+    /* === Compute highlight width from longest command in active column === */
+    s->sel_highlight_w = 0;
+    if (active_abs_col >= 0) {
+        for (int i = 0; i < s->merged_count; i++) {
+            if (s->merged[i].col_idx == active_abs_col) {
+                int len = (int)strlen(s->merged[i].cmd->command);
+                if (len > s->sel_highlight_w) s->sel_highlight_w = len;
+            }
+        }
+    }
+
+    /* === Command rows (merged timeline: bottom = newest) === */
+    for (int r = 0; r < vis_rows; r++) {
+        int data_row = vis_rows - 1 - r;
+        int merged_idx = s->scroll_offset + data_row;
+        merged_row *entry = (merged_idx < s->merged_count) ? &s->merged[merged_idx] : NULL;
+        int is_cursor_row = (data_row == s->cur_row);
+
+        int filled = 0;
+        for (int c = 0; c < s->visible_columns; c++) {
+            int abs_c = s->col_offset + c;
+            int has_cmd = (entry && entry->col_idx == abs_c);
+            int is_selected = (is_cursor_row && has_cmd);
+
+            if (has_cmd) {
+                int avail = s->size.cols - c * s->col_width;
+                render_command_cell(s, entry->cmd, is_selected, avail);
+                filled = s->size.cols;
+                break;
+            } else {
+                buf_printf(s, "%-*s", s->col_width, "");
+                filled += s->col_width;
+            }
+        }
+        for (int i = filled; i < s->size.cols; i++) buf_puts(s, " ");
+        if (r < vis_rows - 1) buf_puts(s, "\r\n");
+    }
 
     lh_term_write(s->render_buf, s->render_len);
     s->needs_redraw = 0;
@@ -659,7 +659,7 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
     int cmd_text_offset = 10;
     state.left_pad = (cursor_col > cmd_text_offset + 1) ? cursor_col - cmd_text_offset - 1 : 0;
     state.origin_row = 1;
-    state.tui_height = cursor_row + 2;
+    state.tui_height = cursor_row;
     if (state.tui_height < MIN_TUI_ROWS)
         state.tui_height = MIN_TUI_ROWS;
     if (state.tui_height > state.size.rows)
@@ -671,6 +671,16 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
         lh_term_raw_exit();
         g_state = NULL;
         return 0;
+    }
+
+    if (state.current_session_id && state.merged_count > 0) {
+        for (int i = 0; i < state.merged_count; i++) {
+            if (state.merged[i].col_idx == 0) {
+                state.scroll_offset = i;
+                state.cur_row = 0;
+                break;
+            }
+        }
     }
 
     lh_db_compute_stats(state.db, &state.stats);
