@@ -46,7 +46,6 @@ int lh_term_raw_enter(void) {
     raw_mode_active = 1;
 
     lh_term_puts("\x1b[?25l");
-    lh_term_puts("\x1b[?1049h");
 
     return tty_fd;
 }
@@ -54,10 +53,13 @@ int lh_term_raw_enter(void) {
 void lh_term_raw_exit(void) {
     if (!raw_mode_active) return;
 
-    lh_term_puts("\x1b[?1049l");
     lh_term_puts("\x1b[?25h");
 
-    tcsetattr(tty_fd, TCSAFLUSH, &orig_termios);
+    tcsetattr(tty_fd, TCSANOW, &orig_termios);
+
+    signal(SIGWINCH, SIG_DFL);
+    resize_callback = NULL;
+
     close(tty_fd);
     tty_fd = -1;
     raw_mode_active = 0;
