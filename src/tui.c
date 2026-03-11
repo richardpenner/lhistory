@@ -73,8 +73,9 @@ typedef struct {
     int merged_count;
     int origin_row;
     int tui_height;
-    int left_pad;
-    int sel_highlight_w;
+    int col_width;
+    int left_margin;
+    int cursor_col;
 } tui_state;
 
 static tui_state *g_state = NULL;
@@ -228,9 +229,7 @@ static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) 
         }
     }
 
-    int time_width = 9;
-    int cmd_max = s->size.cols - time_width - 1 - s->left_pad;
-    if (cmd_max < 1) cmd_max = 1;
+    int cmd_max = s->col_width;
 
     char cmd_trunc[512];
     snprintf(cmd_trunc, sizeof(cmd_trunc), "%s", cmd->command);
@@ -245,8 +244,9 @@ static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) 
         } else {
             cmd_trunc[cmd_max] = '\0';
         }
-        clen = cmd_max;
     }
+
+    buf_printf(s, "%*s", s->left_margin, "");
 
     buf_puts(s, C_TIME_FG);
     buf_printf(s, "%s ", timebuf);
@@ -254,23 +254,19 @@ static void render_command_cell(tui_state *s, lh_command *cmd, int is_selected) 
     buf_printf(s, "%c", exit_indicator);
     buf_puts(s, C_RESET);
 
-    for (int i = 0; i < s->left_pad; i++) buf_puts(s, " ");
     if (is_selected) {
-        int hw = s->sel_highlight_w;
-        if (hw > cmd_max) hw = cmd_max;
         buf_puts(s, C_SEL_BG C_SEL_FG);
-        buf_printf(s, "%-*s", hw, cmd_trunc);
+        buf_printf(s, "%-*s", cmd_max, cmd_trunc);
         buf_puts(s, C_RESET);
-        int printed = (int)strlen(cmd_trunc);
-        if (printed < hw) printed = hw;
-        if (printed < cmd_max)
-            buf_printf(s, "%*s", cmd_max - printed, "");
     } else {
         buf_printf(s, "%-*s", cmd_max, cmd_trunc);
     }
 }
 
 static void render_status_line(tui_state *s) {
+    int total_w = 10 + s->col_width;
+    buf_printf(s, "%*s", s->left_margin, "");
+
     buf_puts(s, C_STATUS_BG);
     if (s->mode == MODE_SEARCH) {
         buf_puts(s, C_SEARCH_FG);
@@ -280,49 +276,38 @@ static void render_status_line(tui_state *s) {
         snprintf(match_info, sizeof(match_info), " (%d)", s->merged_count);
         buf_puts(s, C_STATUS_FG);
         buf_puts(s, match_info);
-        int fill = s->size.cols - s->search_len - 3 - (int)strlen(match_info);
-        for (int i = 0; i < fill; i++) buf_puts(s, " ");
-    } else if (s->num_columns > 1) {
-        int used = 1;
-        buf_puts(s, " ");
-        for (int i = 0; i < s->num_columns && used < s->size.cols - 1; i++) {
-            tui_column *tc = &s->columns[i];
-            int is_home = (i == 0);
-            int is_active = (i == s->active_session);
-
-            char label[32];
-            char dir_tail[20];
-            const char *d = tc->session->directory;
-            const char *slash = strrchr(d, '/');
-            const char *tail = (slash && slash[1]) ? slash + 1 : d;
-            snprintf(dir_tail, sizeof(dir_tail), "%s", tail);
-
-            if (is_home)
-                snprintf(label, sizeof(label), "\xe2\x97\x86%s", dir_tail);
-            else
-                snprintf(label, sizeof(label), "%s", dir_tail);
-
-            int llen = (int)strlen(label);
-            int cell = llen + 2;
-            if (used + cell + 1 > s->size.cols) break;
-
-            if (is_active) {
-                buf_puts(s, C_TAB_BG C_TAB_FG C_BOLD);
-                if (is_home) buf_puts(s, C_HOME_FG);
-                buf_printf(s, " %s ", label);
-                buf_puts(s, C_RESET C_STATUS_BG);
-            } else {
-                buf_puts(s, C_STATUS_FG C_DIM);
-                if (is_home) buf_puts(s, C_HOME_FG C_DIM);
-                buf_printf(s, " %s ", label);
-                buf_puts(s, C_RESET C_STATUS_BG);
-            }
-            used += cell;
-        }
-        int fill = s->size.cols - used;
+        int fill = total_w - s->search_len - 3 - (int)strlen(match_info);
         for (int i = 0; i < fill; i++) buf_puts(s, " ");
     } else {
-        buf_printf(s, "%-*s", s->size.cols, "");
+        int has_left = (s->num_columns > 1 && s->active_session > 0);
+        int has_right = (s->num_columns > 1 && s->active_session < s->num_columns - 1);
+
+        tui_column *tc = &s->columns[s->active_session];
+        const char *d = tc->session->directory;
+        const char *slash = strrchr(d, '/');
+        const char *tail = (slash && slash[1]) ? slash + 1 : d;
+
+        char left_arrow[8] = " ";
+        char right_arrow[8] = " ";
+        if (has_left) snprintf(left_arrow, sizeof(left_arrow), "\xe2\x97\x82");
+        if (has_right) snprintf(right_arrow, sizeof(right_arrow), "\xe2\x96\xb8");
+
+        if (has_left || has_right)
+            buf_puts(s, C_DIM);
+        buf_printf(s, " %s", left_arrow);
+        buf_puts(s, C_RESET C_STATUS_BG);
+        buf_puts(s, C_STATUS_FG C_BOLD);
+        buf_printf(s, " %s ", tail);
+        buf_puts(s, C_RESET C_STATUS_BG);
+        if (has_left || has_right)
+            buf_puts(s, C_DIM);
+        buf_printf(s, "%s", right_arrow);
+        buf_puts(s, C_RESET C_STATUS_BG);
+
+        int label_len = (int)strlen(tail);
+        int arrow_w = 4 + label_len + 2 + 1;
+        int fill = total_w - arrow_w;
+        for (int i = 0; i < fill; i++) buf_puts(s, " ");
     }
     buf_puts(s, C_RESET);
 }
@@ -345,14 +330,24 @@ static void render(tui_state *s) {
 
     int vis_rows = max_visible_rows(s);
 
-    s->sel_highlight_w = 0;
+    #define MAX_CMD_WIDTH 60
+    int longest = 0;
     for (int i = 0; i < item_count; i++) {
         lh_command *cmd = current_item(s, i);
         if (cmd) {
             int len = (int)strlen(cmd->command);
-            if (len > s->sel_highlight_w) s->sel_highlight_w = len;
+            if (len > longest) longest = len;
         }
     }
+    s->col_width = longest < MAX_CMD_WIDTH ? longest : MAX_CMD_WIDTH;
+    if (s->col_width < 20) s->col_width = 20;
+    int prefix_w = 10;
+    s->left_margin = s->cursor_col - prefix_w - 1;
+    if (s->left_margin < 0) s->left_margin = 0;
+    int total_w = prefix_w + s->col_width;
+    int avail = s->size.cols - s->left_margin;
+    if (total_w > avail && avail > prefix_w)
+        s->col_width = avail - prefix_w;
 
     render_status_line(s);
     buf_puts(s, "\r\n");
@@ -366,7 +361,7 @@ static void render(tui_state *s) {
         if (cmd) {
             render_command_cell(s, cmd, is_selected);
         } else {
-            buf_printf(s, "%-*s", s->size.cols, "");
+            buf_printf(s, "%*s", s->left_margin + total_w, "");
         }
         if (r < vis_rows - 1) buf_puts(s, "\r\n");
     }
@@ -426,11 +421,10 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
     state.current_session_id = current_session_id;
     g_state = &state;
 
-    int tty_fd = open("/dev/tty", O_RDWR);
-    if (tty_fd < 0) return 0;
-
     int cursor_row = 0, cursor_col = 0;
     {
+        int tty_fd = open("/dev/tty", O_RDWR);
+        if (tty_fd < 0) return 0;
         struct termios old, tmp;
         tcgetattr(tty_fd, &old);
         tmp = old;
@@ -461,25 +455,29 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
         close(tty_fd);
     }
 
-    state.size = lh_term_get_size();
-    if (cursor_row < 1) cursor_row = state.size.rows;
-    int cmd_text_offset = 10;
-    state.left_pad = (cursor_col > cmd_text_offset + 1) ? cursor_col - cmd_text_offset - 1 : 0;
-
-    state.tui_height = cursor_row;
-    if (state.tui_height < 2)
-        state.tui_height = 2;
-    state.origin_row = cursor_row - state.tui_height + 1;
-    if (state.origin_row < 1) state.origin_row = 1;
-
     int fd = lh_term_raw_enter();
     if (fd < 0) return 0;
+
+    state.size = lh_term_get_size();
+    if (cursor_row < 1) cursor_row = state.size.rows;
+    const char *col_env = getenv("LHISTORY_COL");
+    if (col_env && atoi(col_env) > 0) cursor_col = atoi(col_env);
+    if (cursor_col < 1) cursor_col = 1;
+    state.cursor_col = cursor_col;
+
+    lh_term_write("\x1b[?1049h\x1b[?25l", 14);
+
+    state.tui_height = cursor_row;
+    if (state.tui_height < 2) state.tui_height = 2;
+    state.origin_row = cursor_row - state.tui_height + 1;
+    if (state.origin_row < 1) state.origin_row = 1;
 
     lh_term_on_resize(resize_handler);
 
     load_data(&state);
 
     if (state.num_columns == 0) {
+        lh_term_write("\x1b[?25h\x1b[?1049l", 14);
         lh_term_raw_exit();
         g_state = NULL;
         return 0;
@@ -648,11 +646,7 @@ int lh_tui_browse(sqlite3 *db, char *result_buf, int result_buf_size,
         }
     }
 
-    {
-        char seq[32];
-        int n = snprintf(seq, sizeof(seq), "\x1b[%d;1H", cursor_row);
-        lh_term_write(seq, n);
-    }
+    lh_term_write("\x1b[?25h\x1b[?1049l", 14);
 
     lh_term_raw_exit();
     cleanup_data(&state);

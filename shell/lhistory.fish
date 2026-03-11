@@ -32,7 +32,9 @@ end
 
 # TUI browser function
 function _lhistory_browse
-    set -l selected (command $_LHISTORY_BIN browse </dev/tty)
+    set -l prompt_w (string length -- (fish_prompt))
+    set -l col (math $prompt_w + (commandline -C) + 1)
+    set -l selected (LHISTORY_COL=$col command $_LHISTORY_BIN browse </dev/tty)
     if test -n "$selected"
         commandline -r -- "$selected"
         commandline -f repaint

@@ -26,8 +26,10 @@ _lhistory_precmd() {
 
 # TUI browser widget for zle
 _lhistory_browse_widget() {
+    local prompt_w=${#${(%%)PROMPT}}
+    local col=$((prompt_w + CURSOR + 1))
     local selected
-    selected="$("$_LHISTORY_BIN" browse </dev/tty)"
+    selected="$(LHISTORY_COL=$col "$_LHISTORY_BIN" browse </dev/tty)"
     if [[ -n "$selected" ]]; then
         LBUFFER="$selected"
         RBUFFER=""

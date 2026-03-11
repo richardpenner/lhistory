@@ -43,8 +43,11 @@ _lhistory_prompt_cmd() {
 
 # TUI browser function for readline binding
 _lhistory_browse() {
+    local curpos col
+    printf '\e[6n' > /dev/tty
+    IFS=';' read -rsd R _ col < /dev/tty
     local selected
-    selected="$("$_LHISTORY_BIN" browse </dev/tty)"
+    selected="$(LHISTORY_COL=$col "$_LHISTORY_BIN" browse </dev/tty)"
     if [[ -n "$selected" ]]; then
         READLINE_LINE="$selected"
         READLINE_POINT=${#selected}
