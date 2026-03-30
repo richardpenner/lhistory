@@ -18,7 +18,8 @@ static void usage(void) {
         "  finish  --sid <id> --exit-code <code>\n"
         "  browse  Launch the TUI history browser\n"
         "  init    <shell>  Output shell integration code\n"
-        "  install Append source line to shell rc files\n"
+        "  install   Append source line to shell rc files\n"
+        "  uninstall Remove lhistory lines from shell rc files\n"
         "\n");
 }
 
@@ -166,6 +167,51 @@ static int cmd_init(const char *shell) {
     return 1;
 }
 
+static int cmd_uninstall(void) {
+    const char *home = getenv("HOME");
+    if (!home) { fprintf(stderr, "lhistory: $HOME not set\n"); return 1; }
+
+    const char *rc_files[] = { ".zshrc", ".bashrc", ".config/fish/config.fish" };
+    const char *names[]    = { "zsh",    "bash",    "fish" };
+    int removed = 0;
+
+    for (int i = 0; i < 3; i++) {
+        char rc_path[1024];
+        snprintf(rc_path, sizeof(rc_path), "%s/%s", home, rc_files[i]);
+
+        FILE *f = fopen(rc_path, "r");
+        if (!f) continue;
+
+        char lines[4096][512];
+        int nlines = 0;
+        int found = 0;
+        while (nlines < 4096 && fgets(lines[nlines], sizeof(lines[0]), f)) {
+            if (strstr(lines[nlines], "lhistory")) { found++; continue; }
+            nlines++;
+        }
+        fclose(f);
+
+        if (!found) {
+            printf("  %s: no lhistory lines found (%s)\n", names[i], rc_path);
+            continue;
+        }
+
+        f = fopen(rc_path, "w");
+        if (!f) { fprintf(stderr, "  %s: cannot write to %s\n", names[i], rc_path); continue; }
+        for (int j = 0; j < nlines; j++) fputs(lines[j], f);
+        fclose(f);
+        printf("  %s: removed %d line(s) from %s\n", names[i], found, rc_path);
+        removed++;
+    }
+
+    if (removed == 0) {
+        printf("No shell integrations found to remove.\n");
+    } else {
+        printf("\nRestart your shell to complete uninstallation.\n");
+    }
+    return 0;
+}
+
 static int cmd_install(void) {
     const char *home = getenv("HOME");
     if (!home) { fprintf(stderr, "lhistory: $HOME not set\n"); return 1; }
@@ -261,6 +307,8 @@ int main(int argc, char **argv) {
         return cmd_init(argv[2]);
     } else if (strcmp(subcmd, "install") == 0) {
         return cmd_install();
+    } else if (strcmp(subcmd, "uninstall") == 0) {
+        return cmd_uninstall();
     } else if (strcmp(subcmd, "--help") == 0 || strcmp(subcmd, "-h") == 0) {
         usage();
         return 0;

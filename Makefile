@@ -1,4 +1,4 @@
-VERSION = 0.4.0
+VERSION = 0.5.0
 CC = cc
 CFLAGS = -O2 -Wall -Wextra -pedantic -std=c11 -DLHISTORY_VERSION='"$(VERSION)"'
 CFLAGS_SQLITE = -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION
@@ -38,4 +38,9 @@ install: lhistory
 	install -m 755 lhistory $(PREFIX)/bin/
 	install -m 644 shell/* $(PREFIX)/share/lhistory/
 
-.PHONY: test clean install
+uninstall:
+	$(PREFIX)/bin/lhistory uninstall || true
+	rm -f $(PREFIX)/bin/lhistory
+	rm -rf $(PREFIX)/share/lhistory
+
+.PHONY: test clean install uninstall
