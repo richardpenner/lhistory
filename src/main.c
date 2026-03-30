@@ -216,30 +216,20 @@ static int cmd_install(void) {
     const char *home = getenv("HOME");
     if (!home) { fprintf(stderr, "lhistory: $HOME not set\n"); return 1; }
 
-    char bin_path[1024] = "lhistory";
-#ifdef __APPLE__
-    {
-        uint32_t bufsize = sizeof(bin_path);
-        _NSGetExecutablePath(bin_path, &bufsize);
-    }
-#else
-    {
-        ssize_t n = readlink("/proc/self/exe", bin_path, sizeof(bin_path) - 1);
-        if (n > 0) bin_path[n] = '\0';
-    }
-#endif
-
     const char *shell_env = getenv("SHELL");
     if (!shell_env) shell_env = "/bin/zsh";
 
     struct {
         const char *name;
         const char *rc;
-        const char *eval_fmt; /* shell-specific eval syntax */
+        const char *eval_line;
     } shells[] = {
-        {"zsh",  ".zshrc",                    "\n# lhistory - cross-shell history browser\neval \"$(%s init zsh)\"\n"},
-        {"bash", ".bashrc",                   "\n# lhistory - cross-shell history browser\neval \"$(%s init bash)\"\n"},
-        {"fish", ".config/fish/config.fish",  "\n# lhistory - cross-shell history browser\neval (%s init fish)\n"},
+        {"zsh",  ".zshrc",
+         "\n# lhistory - cross-shell history browser\ncommand -v lhistory &>/dev/null && eval \"$(lhistory init zsh)\"\n"},
+        {"bash", ".bashrc",
+         "\n# lhistory - cross-shell history browser\ncommand -v lhistory &>/dev/null && eval \"$(lhistory init bash)\"\n"},
+        {"fish", ".config/fish/config.fish",
+         "\n# lhistory - cross-shell history browser\ncommand -sq lhistory; and eval (lhistory init fish)\n"},
     };
 
     int installed = 0;
@@ -271,7 +261,7 @@ static int cmd_install(void) {
             fprintf(stderr, "  %s: cannot write to %s\n", shells[i].name, rc_path);
             continue;
         }
-        fprintf(f, shells[i].eval_fmt, bin_path);
+        fputs(shells[i].eval_line, f);
         fclose(f);
         printf("  %s: added to %s\n", shells[i].name, rc_path);
         installed++;
